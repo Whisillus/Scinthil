@@ -1,0 +1,38 @@
+# Local tool state
+.artamir/
+
+# Build directories
+build/
+cmake-build-*/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+
+# C/C++/CUDA build artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.ptx
+*.cubin
+*.fatbin
+
+# Logs and crash dumps
+*.log
+core
+core.*
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
