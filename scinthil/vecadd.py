@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import tvm_ffi
+
+from .jit import build_source_module
 
 
 _ENV_LIBRARY = "SCINTHIL_VECADD_LIBRARY"
@@ -15,6 +17,10 @@ _CANDIDATE_NAMES = (
     "scinthil_vecadd.so",
 )
 _MODULE_CACHE: dict[str, Any] = {}
+
+
+def _default_source_path() -> Path:
+    return Path(__file__).resolve().parent / "cuda" / "vecadd" / "vecadd.cu"
 
 
 def load_library(path: str | os.PathLike[str] | None = None) -> Any:
@@ -65,14 +71,77 @@ def load_library(path: str | os.PathLike[str] | None = None) -> Any:
     return module
 
 
+def build_jit(
+    *,
+    source_path: str | os.PathLike[str] | None = None,
+    extra_cuda_cflags: Sequence[str] | None = None,
+    build_directory: str | os.PathLike[str] | None = None,
+    backend: str = "cuda",
+    rebuild: bool = False,
+) -> Path:
+    """Build the vecadd TVM-FFI source and return its shared-library path."""
+    return build_source_module(
+        name="scinthil_vecadd",
+        sources=[source_path or _default_source_path()],
+        extra_cuda_cflags=extra_cuda_cflags,
+        build_directory=build_directory,
+        backend=backend,
+        rebuild=rebuild,
+    )
+
+
+def load_jit(
+    *,
+    source_path: str | os.PathLike[str] | None = None,
+    extra_cuda_cflags: Sequence[str] | None = None,
+    build_directory: str | os.PathLike[str] | None = None,
+    backend: str = "cuda",
+    rebuild: bool = False,
+) -> Any:
+    """Build if needed, then load and cache the vecadd TVM-FFI source module."""
+    binary_path = build_jit(
+        source_path=source_path,
+        extra_cuda_cflags=extra_cuda_cflags,
+        build_directory=build_directory,
+        backend=backend,
+        rebuild=rebuild,
+    )
+    cache_key = str(binary_path)
+    module = None if rebuild else _MODULE_CACHE.get(cache_key)
+    if module is None:
+        module = tvm_ffi.load_module(cache_key)
+        _MODULE_CACHE[cache_key] = module
+    return module
+
+
 def vecadd(
     out: Any,
     a: Any,
     b: Any,
     library_path: str | os.PathLike[str] | None = None,
+    *,
+    jit: bool = False,
+    jit_source_path: str | os.PathLike[str] | None = None,
+    jit_extra_cuda_cflags: Sequence[str] | None = None,
+    jit_build_directory: str | os.PathLike[str] | None = None,
+    jit_backend: str = "cuda",
+    jit_rebuild: bool = False,
 ) -> Any:
     """Add ``a`` and ``b`` into preallocated ``out`` and return ``out``."""
-    module = load_library(library_path)
+    if jit and library_path is not None:
+        raise ValueError("Pass either library_path or jit=True for vecadd, not both.")
+
+    module = (
+        load_jit(
+            source_path=jit_source_path,
+            extra_cuda_cflags=jit_extra_cuda_cflags,
+            build_directory=jit_build_directory,
+            backend=jit_backend,
+            rebuild=jit_rebuild,
+        )
+        if jit
+        else load_library(library_path)
+    )
 
     try:
         func = module["vecadd"]
@@ -99,4 +168,4 @@ def vecadd(
     return out
 
 
-__all__ = ["load_library", "vecadd"]
+__all__ = ["build_jit", "load_jit", "load_library", "vecadd"]

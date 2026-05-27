@@ -1,0 +1,30 @@
+exclude: (^|/)\.[^/]+/|^(3rdparty/|build/|dist/|cmake-build-[^/]+/)
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-yaml
+        files: ^\.pre-commit-config\.yaml$
+      - id: check-toml
+        files: ^pyproject\.toml$
+      - id: end-of-file-fixer
+        files: ^(pyproject\.toml|\.pre-commit-config\.yaml|scinthil/.*\.py)$
+      - id: trailing-whitespace
+        files: ^(pyproject\.toml|\.pre-commit-config\.yaml|scinthil/.*\.py)$
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^scinthil/.*\.py$
+      - id: ruff-format
+        files: ^scinthil/.*\.py$
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.1
+    hooks:
+      - id: mypy
+        args: [--config-file=pyproject.toml]
+        files: ^scinthil/.*\.py$
+        pass_filenames: false
