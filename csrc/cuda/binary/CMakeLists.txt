@@ -1,2 +1,1 @@
-# Binary kernel sources are header-only for now. Root-level example/ and test/
-# folders build executable coverage for this code.
+target_sources(scinthil INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/binary.cuh")

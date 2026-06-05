@@ -1,16 +1,17 @@
 include_guard(GLOBAL)
 
-get_filename_component(SCINTHIL_REPOSITORY_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
-get_filename_component(SCINTHIL_CSRC_DIR "${SCINTHIL_REPOSITORY_ROOT}/csrc" ABSOLUTE)
-
 function(scinthil_add_cuda_executable target_name)
+  if(NOT TARGET scinthil)
+    message(
+      FATAL_ERROR
+        "scinthil_add_cuda_executable requires the scinthil target. "
+        "Call add_subdirectory(csrc) before adding CUDA executables.")
+  endif()
+
   add_executable(${target_name})
   target_sources(${target_name} PRIVATE ${ARGN})
-  target_include_directories(
-    ${target_name}
-    PRIVATE ${SCINTHIL_CSRC_DIR} ${SCINTHIL_CSRC_DIR}/cuda/binary
-            ${SCINTHIL_REPOSITORY_ROOT}/3rdparty/cutlass/include
-            ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(${target_name} PRIVATE scinthil)
+  target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_compile_options(
     ${target_name}
     PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-std=c++20>"
