@@ -1,1 +1,1 @@
-scinthil_add_cuda_executable(scinthil_example_binary_add add.cu)
+scinthil_add_cuda_example(scinthil_example_binary_add add.cu)
