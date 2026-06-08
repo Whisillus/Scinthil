@@ -12,10 +12,14 @@ function(scinthil_add_cuda_executable target_name)
   target_sources(${target_name} PRIVATE ${ARGN})
   target_link_libraries(${target_name} PRIVATE scinthil)
   target_include_directories(${target_name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_compile_options(
+  set_target_properties(
     ${target_name}
-    PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-std=c++20>"
-            "$<$<COMPILE_LANGUAGE:CUDA>:--std=c++20>")
+    PROPERTIES CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CXX_EXTENSIONS OFF
+               CUDA_STANDARD 20
+               CUDA_STANDARD_REQUIRED ON
+               CUDA_EXTENSIONS OFF)
 endfunction()
 
 function(scinthil_add_cuda_example target_name)

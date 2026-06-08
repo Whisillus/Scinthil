@@ -6,12 +6,9 @@
 
 namespace scinthil::test::binary {
 
-[[nodiscard]] inline bool verify_add(std::span<const float> lhs,
-                                     std::span<const float> rhs,
-                                     std::span<const float> out,
+[[nodiscard]] inline bool verify_add(std::span<const float> lhs, std::span<const float> rhs, std::span<const float> out,
                                      float tolerance) {
-  if (lhs.size() != rhs.size() || lhs.size() != out.size() ||
-      !(tolerance >= 0.0F)) {
+  if (lhs.size() != rhs.size() || lhs.size() != out.size() || !(tolerance >= 0.0F)) {
     return false;
   }
 
@@ -25,4 +22,4 @@ namespace scinthil::test::binary {
   return true;
 }
 
-} // namespace scinthil::test::binary
+}  // namespace scinthil::test::binary
