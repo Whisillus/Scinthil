@@ -1,0 +1,1 @@
+scinthil_add_cuda_example(scinthil_example_tma_copy tma_copy.cu)

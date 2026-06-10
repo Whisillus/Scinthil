@@ -9,7 +9,7 @@
 #include <random>
 
 #include "cuda/binary/binary.cuh"
-#include "util/utils.cuh"
+#include "utils/utils.cuh"
 
 namespace scinthil::test::binary {
 

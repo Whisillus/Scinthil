@@ -6,17 +6,15 @@
 #include <vector>
 
 #include "cuda/binary/binary.cuh"
-#include "util/utils.cuh"
+#include "utils/utils.cuh"
 
-namespace {
+namespace scinthil::example::binary {
 
 struct Add {
   __host__ __device__ constexpr float operator()(float lhs, float rhs) const { return lhs + rhs; }
 };
 
-}  // namespace
-
-int main() {
+[[nodiscard]] int add() {
   constexpr std::size_t n{1024};
   const auto bytes = n * sizeof(float);
 
@@ -61,3 +59,7 @@ int main() {
   std::fprintf(stderr, "binary add example failed\n");
   return EXIT_FAILURE;
 }
+
+}  // namespace scinthil::example::binary
+
+int main() { return scinthil::example::binary::add(); }

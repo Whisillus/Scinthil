@@ -22,10 +22,8 @@ function(scinthil_add_cuda_executable target_name)
                CUDA_EXTENSIONS OFF)
 endfunction()
 
-function(scinthil_add_cuda_example target_name)
-  scinthil_add_cuda_executable(${target_name} ${ARGN})
-
-  if(NOT SCINTHIL_BUILD_EXAMPLE_PTX AND NOT SCINTHIL_BUILD_EXAMPLE_SASS)
+function(scinthil_add_cuda_dump_artifacts target_name ptx_enabled sass_enabled artifact_label)
+  if(NOT ${ptx_enabled} AND NOT ${sass_enabled})
     return()
   endif()
 
@@ -37,10 +35,9 @@ function(scinthil_add_cuda_example target_name)
   if(NOT SCINTHIL_CUOBJDUMP_EXECUTABLE)
     message(
       FATAL_ERROR
-        "CUDA dump artifacts are enabled for example '${target_name}', "
+        "CUDA dump artifacts are enabled for ${artifact_label} '${target_name}', "
         "but cuobjdump was not found. Set CMAKE_CUDA_COMPILER_TOOLKIT_ROOT, "
-        "CUDA_PATH, or disable SCINTHIL_BUILD_EXAMPLE_PTX and "
-        "SCINTHIL_BUILD_EXAMPLE_SASS.")
+        "CUDA_PATH, or disable ${ptx_enabled} and ${sass_enabled}.")
   endif()
 
   set(artifact_dir "${CMAKE_CURRENT_BINARY_DIR}/${target_name}.cuda")
@@ -50,7 +47,7 @@ function(scinthil_add_cuda_example target_name)
 
   set(cuda_artifact_outputs)
 
-  if(SCINTHIL_BUILD_EXAMPLE_PTX)
+  if(${ptx_enabled})
     add_custom_command(
       OUTPUT "${ptx_output}"
       COMMAND
@@ -64,7 +61,7 @@ function(scinthil_add_cuda_example target_name)
     list(APPEND cuda_artifact_outputs "${ptx_output}")
   endif()
 
-  if(SCINTHIL_BUILD_EXAMPLE_SASS)
+  if(${sass_enabled})
     add_custom_command(
       OUTPUT "${sass_output}"
       COMMAND
@@ -81,4 +78,9 @@ function(scinthil_add_cuda_example target_name)
   add_custom_target(
     ${target_name}_cuda_artifacts ALL
     DEPENDS ${cuda_artifact_outputs})
+endfunction()
+
+function(scinthil_add_cuda_example target_name)
+  scinthil_add_cuda_executable(${target_name} ${ARGN})
+  scinthil_add_cuda_dump_artifacts(${target_name} SCINTHIL_BUILD_EXAMPLE_PTX SCINTHIL_BUILD_EXAMPLE_SASS example)
 endfunction()
