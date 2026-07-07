@@ -1,0 +1,1 @@
+scinthil_add_cuda_profile(scinthil_profile_binary_add add.cu)

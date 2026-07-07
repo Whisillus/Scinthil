@@ -8,15 +8,15 @@ repos:
       - id: check-toml
         files: ^pyproject\.toml$
       - id: end-of-file-fixer
-        files: ^(CMakeLists\.txt|pyproject\.toml|\.pre-commit-config\.yaml|scinthil/.*\.py|(csrc|example|test)/(.*/)?CMakeLists\.txt|(csrc|scinthil)/cmake/.*\.cmake|(csrc|example|test)/.*\.(cu|cuh|h|hpp|cc|cpp))$
+        files: ^(CMakeLists\.txt|pyproject\.toml|\.pre-commit-config\.yaml|scinthil/.*\.py|(csrc|profile|test)/(.*/)?CMakeLists\.txt|(csrc|scinthil)/cmake/.*\.cmake|(csrc|profile|test)/.*\.(cu|cuh|h|hpp|cc|cpp))$
       - id: trailing-whitespace
-        files: ^(CMakeLists\.txt|pyproject\.toml|\.pre-commit-config\.yaml|scinthil/.*\.py|(csrc|example|test)/(.*/)?CMakeLists\.txt|(csrc|scinthil)/cmake/.*\.cmake|(csrc|example|test)/.*\.(cu|cuh|h|hpp|cc|cpp))$
+        files: ^(CMakeLists\.txt|pyproject\.toml|\.pre-commit-config\.yaml|scinthil/.*\.py|(csrc|profile|test)/(.*/)?CMakeLists\.txt|(csrc|scinthil)/cmake/.*\.cmake|(csrc|profile|test)/.*\.(cu|cuh|h|hpp|cc|cpp))$
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v22.1.0
     hooks:
       - id: clang-format
-        files: ^(csrc|example|test)/.*\.(cu|cuh|h|hpp|cc|cpp)$
+        files: ^(csrc|profile|test)/.*\.(cu|cuh|h|hpp|cc|cpp)$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.8.6

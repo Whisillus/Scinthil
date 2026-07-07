@@ -8,7 +8,7 @@
 #include "cuda/binary/binary.cuh"
 #include "utils/utils.cuh"
 
-namespace scinthil::example::binary {
+namespace scinthil::profile::binary {
 
 struct Add {
   __host__ __device__ constexpr float operator()(float lhs, float rhs) const { return lhs + rhs; }
@@ -52,14 +52,14 @@ struct Add {
 
   success = success && cleanup_success;
   if (success) {
-    std::printf("binary add example launched successfully for %zu elements\n", n);
+    std::printf("binary add profile launched successfully for %zu elements\n", n);
     return EXIT_SUCCESS;
   }
 
-  std::fprintf(stderr, "binary add example failed\n");
+  std::fprintf(stderr, "binary add profile failed\n");
   return EXIT_FAILURE;
 }
 
-}  // namespace scinthil::example::binary
+}  // namespace scinthil::profile::binary
 
-int main() { return scinthil::example::binary::add(); }
+int main() { return scinthil::profile::binary::add(); }

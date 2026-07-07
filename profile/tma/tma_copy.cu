@@ -11,7 +11,7 @@
 #include "cuda/tma/tma_copy.cuh"
 #include "utils/utils.cuh"
 
-namespace scinthil::example::tma {
+namespace scinthil::profile::tma {
 
 using namespace cute;
 
@@ -69,6 +69,6 @@ template <class Element>
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-}  // namespace scinthil::example::tma
+}  // namespace scinthil::profile::tma
 
-int main() { return scinthil::example::tma::tma_copy<float>(); }
+int main() { return scinthil::profile::tma::tma_copy<float>(); }

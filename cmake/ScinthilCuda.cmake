@@ -100,7 +100,7 @@ function(scinthil_add_cuda_dump_artifacts target_name ptx_enabled sass_enabled a
     DEPENDS ${cuda_artifact_outputs})
 endfunction()
 
-function(scinthil_add_cuda_example target_name)
+function(scinthil_add_cuda_profile target_name)
   scinthil_add_cuda_executable(${target_name} ${ARGN})
-  scinthil_add_cuda_dump_artifacts(${target_name} SCINTHIL_BUILD_EXAMPLE_PTX SCINTHIL_BUILD_EXAMPLE_SASS example)
+  scinthil_add_cuda_dump_artifacts(${target_name} SCINTHIL_BUILD_PROFILE_PTX SCINTHIL_BUILD_PROFILE_SASS profile)
 endfunction()

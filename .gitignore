@@ -1,5 +1,6 @@
 # Local tool state
 .artamir/
+.cogrex.md
 
 # Build directories
 build/

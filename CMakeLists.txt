@@ -6,9 +6,9 @@ endif()
 
 project(scinthil LANGUAGES CXX CUDA)
 
-option(SCINTHIL_BUILD_EXAMPLES "Build Scinthil examples" ON)
-option(SCINTHIL_BUILD_EXAMPLE_PTX "Build PTX dump artifacts for Scinthil examples" ON)
-option(SCINTHIL_BUILD_EXAMPLE_SASS "Build SASS dump artifacts for Scinthil examples" ON)
+option(SCINTHIL_BUILD_PROFILES "Build Scinthil profiles" ON)
+option(SCINTHIL_BUILD_PROFILE_PTX "Build PTX dump artifacts for Scinthil profiles" ON)
+option(SCINTHIL_BUILD_PROFILE_SASS "Build SASS dump artifacts for Scinthil profiles" ON)
 option(SCINTHIL_BUILD_TESTS "Build Scinthil tests" ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -16,8 +16,8 @@ include(ScinthilCuda)
 
 add_subdirectory(csrc)
 
-if(SCINTHIL_BUILD_EXAMPLES)
-  add_subdirectory(example)
+if(SCINTHIL_BUILD_PROFILES)
+  add_subdirectory(profile)
 endif()
 
 if(SCINTHIL_BUILD_TESTS)

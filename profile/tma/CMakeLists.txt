@@ -1,0 +1,1 @@
+scinthil_add_cuda_profile(scinthil_profile_tma_copy tma_copy.cu)
