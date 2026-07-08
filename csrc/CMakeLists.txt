@@ -14,3 +14,4 @@ target_link_libraries(scinthil INTERFACE CUDA::cudart CUDA::cuda_driver)
 
 add_subdirectory(utils)
 add_subdirectory(cuda)
+add_subdirectory(gemm)

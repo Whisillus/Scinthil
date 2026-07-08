@@ -1,0 +1,4 @@
+scinthil_add_cuda_executable(scinthil_profile_gemm_sm120_naive launch_naivea_gemm_sm120.cu)
+set_target_properties(scinthil_profile_gemm_sm120_naive PROPERTIES CUDA_ARCHITECTURES 120)
+scinthil_add_cuda_dump_artifacts(
+  scinthil_profile_gemm_sm120_naive SCINTHIL_BUILD_PROFILE_PTX SCINTHIL_BUILD_PROFILE_SASS profile)
