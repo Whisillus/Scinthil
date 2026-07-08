@@ -21,9 +21,21 @@ struct NaiveGEMMKernelSM120 {
   using StrideB = StrideB_;
   using StrideD = StrideD_;
 
+  struct Params {
+    const ElementAB* a;
+    const ElementAB* b;
+    ElementD* d;
+
+    int m;
+    int n;
+    int k;
+
+    StrideA stride_a;
+    StrideB stride_b;
+    StrideD stride_d;
+  };
+
   using TileShape = Shape<Int<16>, Int<8>, Int<16>>;
-  using MmaOp = typename MMAOpSelectorRRSM120<ElementAB, ElementAB, ElementD, size<0>(TileShape{}),
-                                              size<1>(TileShape{}), size<2>(TileShape{})>::Type;
   using SmemLayoutA = decltype(make_layout(select<0, 2>(TileShape{}), make_stride(size<2>(TileShape{}), _1{})));
   using SmemLayoutB = decltype(make_layout(select<1, 2>(TileShape{}), make_stride(size<2>(TileShape{}), _1{})));
 
@@ -32,23 +44,25 @@ struct NaiveGEMMKernelSM120 {
     alignas(128) ArrayEngine<ElementAB, cosize_v<SmemLayoutB>> b;
   };
 
-  static constexpr int threads_per_block{32};
+  static constexpr int MaxThreadsPerBlock{32};
+  static constexpr int MinBlocksPerMultiprocessor{1};
   static constexpr int smem_size{static_cast<int>(sizeof(SharedStorage))};
 
-  static __device__ void run(const ElementAB* a, const ElementAB* b, ElementD* d, int m, int n, int k, StrideA stride_a,
-                             StrideB stride_b, StrideD stride_d) {
-    auto problem_shape = make_shape(m, n, k);
+  using MmaOp = typename MMAOpSelectorRRSM120<ElementAB, ElementAB, ElementD, size<0>(TileShape{}),
+                                              size<1>(TileShape{}), size<2>(TileShape{})>::Type;
 
-    Tensor mA = make_tensor(make_gmem_ptr(a), select<0, 2>(problem_shape), stride_a);
-    Tensor mB = make_tensor(make_gmem_ptr(b), select<1, 2>(problem_shape), stride_b);
-    Tensor mD = make_tensor(make_gmem_ptr(d), select<0, 1>(problem_shape), stride_d);
+  __device__ void operator()(Params const& params, char* shared_memory) const {
+    auto problem_shape = make_shape(params.m, params.n, params.k);
+
+    Tensor mA = make_tensor(make_gmem_ptr(params.a), select<0, 2>(problem_shape), params.stride_a);
+    Tensor mB = make_tensor(make_gmem_ptr(params.b), select<1, 2>(problem_shape), params.stride_b);
+    Tensor mD = make_tensor(make_gmem_ptr(params.d), select<0, 1>(problem_shape), params.stride_d);
 
     auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);
     Tensor gA = local_tile(mA, TileShape{}, cta_coord, Step<_1, X, _1>{});  // (TileM, TileK, k_tile)
     Tensor gB = local_tile(mB, TileShape{}, cta_coord, Step<X, _1, _1>{});  // (TileN, TileK, k_tile)
     Tensor gD = local_tile(mD, TileShape{}, cta_coord, Step<_1, _1, X>{});  // (TileM, TileN)
 
-    extern __shared__ char shared_memory[];
     SharedStorage& storage = *reinterpret_cast<SharedStorage*>(shared_memory);
     Tensor sA = make_tensor(make_smem_ptr(storage.a.begin()), SmemLayoutA{});
     Tensor sB = make_tensor(make_smem_ptr(storage.b.begin()), SmemLayoutB{});
@@ -90,7 +104,7 @@ struct NaiveGEMMKernelSM120 {
     Tensor tXsB = s2r_thr_copy_b.partition_S(sB);
     Tensor tXrB = s2r_thr_copy_b.retile_D(tCrB);
 
-    const int k_tiles = k / size<2>(TileShape{});
+    const int k_tiles = params.k / size<2>(TileShape{});
     for (int k_tile = 0; k_tile < k_tiles; ++k_tile) {
       copy(tiled_copy_a, tAgA(_, _, _, k_tile), tAsA);
       copy(tiled_copy_b, tBgB(_, _, _, k_tile), tBsB);

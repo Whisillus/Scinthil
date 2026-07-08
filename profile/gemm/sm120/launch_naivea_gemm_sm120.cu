@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cutlass/device_kernel.h>
 
 #include <cstdlib>
 #include <cute/numeric/numeric_types.hpp>
@@ -7,19 +8,6 @@
 #include "gemm/sm120/naive_gemm_sm120.cuh"
 
 namespace scinthil::profile::gemm::sm120 {
-
-namespace detail {
-
-template <class ElementAB, class ElementD, class StrideA, class StrideB, class StrideD>
-__launch_bounds__(
-    scinthil::gemm::sm120::NaiveGEMMKernelSM120<ElementAB, ElementD, StrideA, StrideB, StrideD>::threads_per_block)
-    __global__ void naive_gemm_kernel_trampoline(const ElementAB* a, const ElementAB* b, ElementD* d, int m, int n,
-                                                 int k, StrideA stride_a, StrideB stride_b, StrideD stride_d) {
-  using Kernel = scinthil::gemm::sm120::NaiveGEMMKernelSM120<ElementAB, ElementD, StrideA, StrideB, StrideD>;
-  Kernel::run(a, b, d, m, n, k, stride_a, stride_b, stride_d);
-}
-
-}  // namespace detail
 
 template <class ElementAB, class ElementD, class StrideA, class StrideB, class StrideD>
 [[nodiscard]] cudaError_t launch_naive_gemm_sm120(const ElementAB* a, const ElementAB* b, ElementD* d, int m, int n,
@@ -39,10 +27,13 @@ template <class ElementAB, class ElementD, class StrideA, class StrideB, class S
     return cudaErrorInvalidValue;
   }
 
+  typename Kernel::Params params{a, b, d, m, n, k, stride_a, stride_b, stride_d};
+
   dim3 grid(static_cast<unsigned>(m / cute::size<0>(TileShape{})),
             static_cast<unsigned>(n / cute::size<1>(TileShape{})));
-  detail::naive_gemm_kernel_trampoline<ElementAB, ElementD, StrideA, StrideB, StrideD>
-      <<<grid, Kernel::threads_per_block, Kernel::smem_size, stream>>>(a, b, d, m, n, k, stride_a, stride_b, stride_d);
+
+  cutlass::device_kernel<Kernel><<<grid, Kernel::MaxThreadsPerBlock, Kernel::smem_size, stream>>>(params);
+
   return cudaGetLastError();
 }
 
