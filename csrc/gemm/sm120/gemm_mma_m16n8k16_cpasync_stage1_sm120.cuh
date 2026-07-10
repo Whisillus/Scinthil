@@ -14,19 +14,19 @@ namespace scinthil::gemm::sm120 {
 using namespace cute;
 
 template <class ElementAB, class SmemLayoutA, class SmemLayoutB>
-struct NaiveGEMMSM120SharedStorage {
+struct GemmMmaM16N8K16CpAsyncStage1SM120SharedStorage {
   alignas(128) ArrayEngine<ElementAB, cosize_v<SmemLayoutA>> a;
   alignas(128) ArrayEngine<ElementAB, cosize_v<SmemLayoutB>> b;
 };
 
 template <class ElementAB, class ElementD, class StrideA, class StrideB, class StrideD>
 __launch_bounds__(32, 1) __global__
-    void naive_gemm_kernel_sm120(const ElementAB* a, const ElementAB* b, ElementD* d, int m, int n, int k,
-                                 StrideA stride_a, StrideB stride_b, StrideD stride_d) {
+    void gemm_mma_m16n8k16_cpasync_stage1_sm120(const ElementAB* a, const ElementAB* b, ElementD* d, int m, int n,
+                                                int k, StrideA stride_a, StrideB stride_b, StrideD stride_d) {
   using TileShape = Shape<Int<16>, Int<8>, Int<16>>;
   using SmemLayoutA = decltype(make_layout(select<0, 2>(TileShape{}), make_stride(size<2>(TileShape{}), _1{})));
   using SmemLayoutB = decltype(make_layout(select<1, 2>(TileShape{}), make_stride(size<2>(TileShape{}), _1{})));
-  using Storage = NaiveGEMMSM120SharedStorage<ElementAB, SmemLayoutA, SmemLayoutB>;
+  using Storage = GemmMmaM16N8K16CpAsyncStage1SM120SharedStorage<ElementAB, SmemLayoutA, SmemLayoutB>;
   using MmaOp = typename MMAOpSelectorRRSM120<ElementAB, ElementAB, ElementD, size<0>(TileShape{}),
                                               size<1>(TileShape{}), size<2>(TileShape{})>::Type;
   constexpr int threads_per_block{32};
@@ -103,9 +103,11 @@ __launch_bounds__(32, 1) __global__
 }
 
 template <class ElementAB, class ElementD, class StrideA, class StrideB, class StrideD>
-[[nodiscard]] cudaError_t launch_naive_gemm_sm120(const ElementAB* a, const ElementAB* b, ElementD* d, int m, int n,
-                                                  int k, StrideA stride_a, StrideB stride_b, StrideD stride_d,
-                                                  cudaStream_t stream = nullptr) {
+[[nodiscard]] cudaError_t launch_gemm_mma_m16n8k16_cpasync_stage1_sm120(const ElementAB* a, const ElementAB* b,
+                                                                        ElementD* d, int m, int n, int k,
+                                                                        StrideA stride_a, StrideB stride_b,
+                                                                        StrideD stride_d,
+                                                                        cudaStream_t stream = nullptr) {
   auto tile_shape = make_shape(Int<16>{}, Int<8>{}, Int<16>{});
 
   if (m <= 0 || n <= 0 || k <= 0) {
@@ -120,7 +122,7 @@ template <class ElementAB, class ElementD, class StrideA, class StrideB, class S
 
   dim3 grid(static_cast<unsigned>(m / size<0>(tile_shape)), static_cast<unsigned>(n / size<1>(tile_shape)));
 
-  naive_gemm_kernel_sm120<ElementAB, ElementD, StrideA, StrideB, StrideD>
+  gemm_mma_m16n8k16_cpasync_stage1_sm120<ElementAB, ElementD, StrideA, StrideB, StrideD>
       <<<grid, 32, 0, stream>>>(a, b, d, m, n, k, stride_a, stride_b, stride_d);
 
   return cudaGetLastError();
