@@ -53,3 +53,7 @@ no_implicit_optional = true
 [[tool.mypy.overrides]]
 module = ["tvm_ffi", "tvm_ffi.*"]
 ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["cutlass", "cutlass.*"]
+ignore_missing_imports = true
