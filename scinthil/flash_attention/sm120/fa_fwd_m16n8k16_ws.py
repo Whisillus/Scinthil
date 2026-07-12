@@ -1,6 +1,8 @@
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
 import cutlass.utils as utils
+from cutlass.cute.nvgpu import cpasync
 
 from .fa_fwd_base import FlashAttentionForwardBase
 from .tile_scheduler import SingleTileScheduler
@@ -28,11 +30,20 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             return False
         if self.num_producer <= 0 or self.num_consumer <= 0:
             return False
+        if self.threads_per_cta > 1024:
+            return False
+
+        # A 128-bit copy moves eight FP16/BF16 elements. Eight vectors span a
+        # 64-element row, so each producer warp covers four rows per iteration.
+        rows_per_copy = self.num_producer * 4
+        if self.tile_m % rows_per_copy != 0 or self.tile_n % rows_per_copy != 0:
+            return False
 
         smem_usage_q = self.tile_m * self.headdim_qk * self.dtype_byte
         smem_usage_k = self.tile_n * self.headdim_qk * self.stage_k * self.dtype_byte
         smem_usage_v = self.tile_n * self.headdim_v * self.stage_v * self.dtype_byte
-        smem_usage = smem_usage_q + smem_usage_k + smem_usage_v
+        smem_usage_barrier = 2 * (self.stage_q + self.stage_k + self.stage_v) * 8
+        smem_usage = smem_usage_q + smem_usage_k + smem_usage_v + smem_usage_barrier
 
         return smem_usage <= utils.get_smem_capacity_in_bytes("sm_120")
 
@@ -65,6 +76,9 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             (self.tile_n, self.headdim_v, self.stage_v),
             (0, 1, 2),
         )
+        self.sQ_size = cute.cosize(self.sQ_layout)
+        self.sK_size = cute.cosize(self.sK_layout)
+        self.sV_size = cute.cosize(self.sV_layout)
 
     def get_qk_pv_mma_atom(self) -> None:
         mma_inst_shape_mnk = (16, 8, 16)
@@ -105,6 +119,103 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             permutation_mnk=permutation_mnk,
         )
 
+    def get_load_qkv_atom(self) -> None:
+        self.load_q_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            self.dtype,
+            num_bits_per_copy=128,
+        )
+        self.load_k_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            self.dtype,
+            num_bits_per_copy=128,
+        )
+        self.load_v_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            self.dtype,
+            num_bits_per_copy=128,
+        )
+
+    def get_load_qkv(self) -> None:
+        self.get_load_qkv_atom()
+        copy_elems = 128 // self.dtype.width
+        producer_threads = self.num_producer * cute.arch.WARP_SIZE
+        vectors_per_row = 64 // copy_elems
+        rows_per_copy = producer_threads // vectors_per_row
+        assert self.tile_m % rows_per_copy == 0
+        assert self.tile_n % rows_per_copy == 0
+        thread_layout = cute.make_layout((rows_per_copy, vectors_per_row), stride=(vectors_per_row, 1))
+        value_layout = cute.make_layout((1, copy_elems))
+        self.tiled_copy_q = cute.make_tiled_copy_tv(
+            self.load_q_atom,
+            thread_layout,
+            value_layout,
+        )
+        self.tiled_copy_k = cute.make_tiled_copy_tv(
+            self.load_k_atom,
+            thread_layout,
+            value_layout,
+        )
+        self.tiled_copy_v = cute.make_tiled_copy_tv(
+            self.load_v_atom,
+            thread_layout,
+            value_layout,
+        )
+
+    @cute.jit
+    def load(
+        self,
+        num_tile_n: cutlass.Int32,
+        q_pipeline: pipeline.PipelineCpAsync,
+        k_pipeline: pipeline.PipelineCpAsync,
+        v_pipeline: pipeline.PipelineCpAsync,
+    ) -> None:
+        q_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_q)
+        k_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_k)
+        v_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_v)
+
+        q_pipeline.producer_acquire(q_producer_state)
+        q_pipeline.producer_commit(q_producer_state)
+        q_producer_state.advance()
+
+        for _ in cutlass.range(0, num_tile_n, 1):
+            k_pipeline.producer_acquire(k_producer_state)
+            k_pipeline.producer_commit(k_producer_state)
+            k_producer_state.advance()
+
+            v_pipeline.producer_acquire(v_producer_state)
+            v_pipeline.producer_commit(v_producer_state)
+            v_producer_state.advance()
+
+        q_pipeline.producer_tail(q_producer_state)
+        k_pipeline.producer_tail(k_producer_state)
+        v_pipeline.producer_tail(v_producer_state)
+
+    @cute.jit
+    def compute(
+        self,
+        num_tile_n: cutlass.Int32,
+        q_pipeline: pipeline.PipelineCpAsync,
+        k_pipeline: pipeline.PipelineCpAsync,
+        v_pipeline: pipeline.PipelineCpAsync,
+    ) -> None:
+        q_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_q)
+        k_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_k)
+        v_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_v)
+
+        q_pipeline.consumer_wait(q_consumer_state)
+        q_pipeline.consumer_release(q_consumer_state)
+        q_consumer_state.advance()
+
+        for _ in cutlass.range(0, num_tile_n, 1):
+            k_pipeline.consumer_wait(k_consumer_state)
+            k_pipeline.consumer_release(k_consumer_state)
+            k_consumer_state.advance()
+
+            v_pipeline.consumer_wait(v_consumer_state)
+            v_pipeline.consumer_release(v_consumer_state)
+            v_consumer_state.advance()
+
     @cute.jit
     def __call__(
         self,
@@ -117,24 +228,36 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
     ) -> None:
         self.get_smem_layout()
         self.get_qk_pv_tiled_mma()
-        sQ_size = cute.cosize(self.sQ_layout)
-        sK_size = cute.cosize(self.sK_layout)
-        sV_size = cute.cosize(self.sV_layout)
+        self.get_load_qkv()
 
         @cute.struct
         class SharedStorage:
-            sQ: cute.struct.Align[cute.struct.MemRange[self.dtype, sQ_size], 128]
-            sK: cute.struct.Align[cute.struct.MemRange[self.dtype, sK_size], 128]
-            sV: cute.struct.Align[cute.struct.MemRange[self.dtype, sV_size], 128]
+            sQ: cute.struct.Align[cute.struct.MemRange[self.dtype, self.sQ_size], 128]
+            sK: cute.struct.Align[cute.struct.MemRange[self.dtype, self.sK_size], 128]
+            sV: cute.struct.Align[cute.struct.MemRange[self.dtype, self.sV_size], 128]
+            q_mbar: cute.struct.MemRange[cutlass.Int64, self.stage_q * 2]
+            k_mbar: cute.struct.MemRange[cutlass.Int64, self.stage_k * 2]
+            v_mbar: cute.struct.MemRange[cutlass.Int64, self.stage_v * 2]
 
-        num_batch, seqlen_q, num_head_q, _ = mQ.shape
+        num_batch, seqlen_q, _, _ = mQ.shape
         num_tile_m = cute.ceil_div(seqlen_q, self.tile_m)
         grid = SingleTileScheduler.get_grid_shape(
             num_tile_m,
-            num_head_q,
+            self.head_q,
             num_batch,
         )
-        self.kernel(mQ, mK, mV, mO, mLSE, softmax_scale, SharedStorage).launch(
+        self.kernel(
+            mQ,
+            mK,
+            mV,
+            mO,
+            mLSE,
+            softmax_scale,
+            self.sQ_layout,
+            self.sK_layout,
+            self.sV_layout,
+            SharedStorage,
+        ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
         )
@@ -148,16 +271,21 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         softmax_scale: cutlass.Float32,
+        sQ_layout: cute.ComposedLayout,
+        sK_layout: cute.ComposedLayout,
+        sV_layout: cute.ComposedLayout,
         SharedStorage: cutlass.Constexpr,
     ) -> None:
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        is_consumer = warp_idx < self.num_consumer
+        is_producer = warp_idx >= self.num_consumer
+        is_producer &= warp_idx < self.num_consumer + self.num_producer
+
         tile_scheduler = SingleTileScheduler.create()
         work_tile = tile_scheduler.initial_work_tile_info()
         tile_m_idx, head_q_idx, batch_idx, _ = work_tile.tile_idx
 
-        num_head_q = mQ.shape[2]
-        num_head_kv = mK.shape[2]
-        qhead_per_kvhead = num_head_q // num_head_kv
-        head_kv_idx = head_q_idx // qhead_per_kvhead
+        head_kv_idx = head_q_idx // self.qhead_per_kvhead
 
         gQ = cute.local_tile(
             mQ[batch_idx, None, head_q_idx, None],
@@ -191,13 +319,44 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
-        sQ = storage.sQ.get_tensor(self.sQ_layout)
-        sK = storage.sK.get_tensor(self.sK_layout)
-        sV = storage.sV.get_tensor(self.sV_layout)
+        sQ = storage.sQ.get_tensor(sQ_layout)
+        sK = storage.sK.get_tensor(sK_layout)
+        sV = storage.sV.get_tensor(sV_layout)
+
+        producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_producer * cute.arch.WARP_SIZE)
+        consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_consumer * cute.arch.WARP_SIZE)
+        q_pipeline = pipeline.PipelineCpAsync.create(
+            barrier_storage=storage.q_mbar.data_ptr(),
+            num_stages=self.stage_q,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            defer_sync=True,
+        )
+        k_pipeline = pipeline.PipelineCpAsync.create(
+            barrier_storage=storage.k_mbar.data_ptr(),
+            num_stages=self.stage_k,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            defer_sync=True,
+        )
+        v_pipeline = pipeline.PipelineCpAsync.create(
+            barrier_storage=storage.v_mbar.data_ptr(),
+            num_stages=self.stage_v,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            defer_sync=True,
+        )
+        pipeline.pipeline_init_arrive()
+        pipeline.pipeline_init_wait()
+
+        num_tile_n = cute.size(gK.shape[2])
+        if is_producer:
+            self.load(num_tile_n, q_pipeline, k_pipeline, v_pipeline)
+        if is_consumer:
+            self.compute(num_tile_n, q_pipeline, k_pipeline, v_pipeline)
 
         assert cute.rank(sQ) == 2
         assert cute.rank(sK) == cute.rank(sV) == 3
-        raise NotImplementedError
 
 
 def check_compile(fa_fwd: FlashAttentionForwardM16N8K16SM120):

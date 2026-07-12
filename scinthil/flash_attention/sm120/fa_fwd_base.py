@@ -24,10 +24,12 @@ class FlashAttentionForwardBase:
         self.acc_dtype = acc_dtype
         self.head_q = head_q
         self.head_kv = head_kv
+        self.qhead_per_kvhead = self.head_q // self.head_kv if self.head_kv > 0 else 0
         self.headdim_qk = headdim_qk
         self.headdim_v = headdim_v
         self.tile_m = tile_m
         self.tile_n = tile_n
+        self.stage_q = 1
         self.stage_k = stage_k
         self.stage_v = stage_v
         self.is_causal = is_causal
@@ -42,6 +44,12 @@ class FlashAttentionForwardBase:
         raise NotImplementedError
 
     def get_smem_layout(self) -> None:
+        raise NotImplementedError
+
+    def get_load_qkv_atom(self) -> None:
+        raise NotImplementedError
+
+    def get_load_qkv(self) -> None:
         raise NotImplementedError
 
     def get_qk_pv_mma_atom(self) -> None:
