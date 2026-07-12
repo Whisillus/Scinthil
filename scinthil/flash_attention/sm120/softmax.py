@@ -1,7 +1,7 @@
 import cutlass
 import cutlass.cute as cute
 
-from .utils import make_acc_tensor_mn_view
+from .fa_utils import make_acc_tensor_mn_view
 
 
 @cute.jit
