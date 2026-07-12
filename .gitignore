@@ -32,6 +32,10 @@ compile_commands.json
 core
 core.*
 
+# Python generated files
+__pycache__/
+*.pyc
+
 # Editor and OS files
 .DS_Store
 Thumbs.db
