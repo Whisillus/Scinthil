@@ -33,12 +33,6 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         if self.threads_per_cta > 1024:
             return False
 
-        # A 128-bit copy moves eight FP16/BF16 elements. Eight vectors span a
-        # 64-element row, so each producer warp covers four rows per iteration.
-        rows_per_copy = self.num_producer * 4
-        if self.tile_m % rows_per_copy != 0 or self.tile_n % rows_per_copy != 0:
-            return False
-
         smem_usage_q = self.tile_m * self.headdim_qk * self.dtype_byte
         smem_usage_k = self.tile_n * self.headdim_qk * self.stage_k * self.dtype_byte
         smem_usage_v = self.tile_n * self.headdim_v * self.stage_v * self.dtype_byte
@@ -120,45 +114,54 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         )
 
     def get_load_qkv_atom(self) -> None:
+        self.num_bits_per_copy = 128
         self.load_q_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             self.dtype,
-            num_bits_per_copy=128,
+            num_bits_per_copy=self.num_bits_per_copy,
         )
         self.load_k_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             self.dtype,
-            num_bits_per_copy=128,
+            num_bits_per_copy=self.num_bits_per_copy,
         )
         self.load_v_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             self.dtype,
-            num_bits_per_copy=128,
+            num_bits_per_copy=self.num_bits_per_copy,
         )
 
     def get_load_qkv(self) -> None:
         self.get_load_qkv_atom()
-        copy_elems = 128 // self.dtype.width
+
+        copy_elems = self.num_bits_per_copy // self.dtype.width
         producer_threads = self.num_producer * cute.arch.WARP_SIZE
-        vectors_per_row = 64 // copy_elems
-        rows_per_copy = producer_threads // vectors_per_row
-        assert self.tile_m % rows_per_copy == 0
-        assert self.tile_n % rows_per_copy == 0
-        thread_layout = cute.make_layout((rows_per_copy, vectors_per_row), stride=(vectors_per_row, 1))
         value_layout = cute.make_layout((1, copy_elems))
+
+        q_vectors_per_row = self.sQ_layout_atom.outer.shape[1] // copy_elems
+        q_rows_per_copy = producer_threads // q_vectors_per_row
+        q_thread_layout = cute.make_layout((q_rows_per_copy, q_vectors_per_row), stride=(q_vectors_per_row, 1))
         self.tiled_copy_q = cute.make_tiled_copy_tv(
             self.load_q_atom,
-            thread_layout,
+            q_thread_layout,
             value_layout,
         )
+
+        k_vectors_per_row = self.sK_layout_atom.outer.shape[1] // copy_elems
+        k_rows_per_copy = producer_threads // k_vectors_per_row
+        k_thread_layout = cute.make_layout((k_rows_per_copy, k_vectors_per_row), stride=(k_vectors_per_row, 1))
         self.tiled_copy_k = cute.make_tiled_copy_tv(
             self.load_k_atom,
-            thread_layout,
+            k_thread_layout,
             value_layout,
         )
+
+        v_vectors_per_row = self.sV_layout_atom.outer.shape[1] // copy_elems
+        v_rows_per_copy = producer_threads // v_vectors_per_row
+        v_thread_layout = cute.make_layout((v_rows_per_copy, v_vectors_per_row), stride=(v_vectors_per_row, 1))
         self.tiled_copy_v = cute.make_tiled_copy_tv(
             self.load_v_atom,
-            thread_layout,
+            v_thread_layout,
             value_layout,
         )
 
