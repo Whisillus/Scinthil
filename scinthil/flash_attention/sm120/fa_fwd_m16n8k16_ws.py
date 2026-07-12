@@ -16,6 +16,10 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             return False
         if self.dtype == cutlass.BFloat16 and self.acc_dtype != cutlass.Float32:
             return False
+        if self.head_q <= 0 or self.head_kv <= 0:
+            return False
+        if self.head_q % self.head_kv != 0:
+            return False
         if self.headdim_qk % 64 != 0 or self.headdim_v % 64 != 0:
             return False
         if self.tile_m % 16 != 0 or self.tile_n % 16 != 0:
@@ -28,7 +32,6 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         smem_usage_q = self.tile_m * self.headdim_qk * self.dtype_byte
         smem_usage_k = self.tile_n * self.headdim_qk * self.stage_k * self.dtype_byte
         smem_usage_v = self.tile_n * self.headdim_v * self.stage_v * self.dtype_byte
-        # O reuses Q's shared-memory storage during the epilogue.
         smem_usage = smem_usage_q + smem_usage_k + smem_usage_v
 
         return smem_usage <= utils.get_smem_capacity_in_bytes("sm_120")
@@ -43,7 +46,6 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         )
         self.sK_layout_atom = self.sQ_layout_atom
         self.sV_layout_atom = self.sQ_layout_atom
-        self.sO_layout_atom = self.sQ_layout_atom
 
     def get_smem_layout(self) -> None:
         self.get_smem_layout_atom()
@@ -62,11 +64,6 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             self.sV_layout_atom,
             (self.tile_n, self.headdim_v, self.stage_v),
             (0, 1, 2),
-        )
-        self.sO_layout = cute.tile_to_shape(
-            self.sO_layout_atom,
-            (self.tile_m, self.headdim_v),
-            (0, 1),
         )
 
     def get_qk_pv_mma_atom(self) -> None:
@@ -115,10 +112,21 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
+        mLSE: cute.Tensor,
         softmax_scale: cutlass.Float32,
     ) -> None:
         self.get_smem_layout()
         self.get_qk_pv_tiled_mma()
+        sQ_size = cute.cosize(self.sQ_layout)
+        sK_size = cute.cosize(self.sK_layout)
+        sV_size = cute.cosize(self.sV_layout)
+
+        @cute.struct
+        class SharedStorage:
+            sQ: cute.struct.Align[cute.struct.MemRange[self.dtype, sQ_size], 128]
+            sK: cute.struct.Align[cute.struct.MemRange[self.dtype, sK_size], 128]
+            sV: cute.struct.Align[cute.struct.MemRange[self.dtype, sV_size], 128]
+
         num_batch, seqlen_q, num_head_q, _ = mQ.shape
         num_tile_m = cute.ceil_div(seqlen_q, self.tile_m)
         grid = SingleTileScheduler.get_grid_shape(
@@ -126,7 +134,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             num_head_q,
             num_batch,
         )
-        self.kernel(mQ, mK, mV, mO, softmax_scale).launch(
+        self.kernel(mQ, mK, mV, mO, mLSE, softmax_scale, SharedStorage).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
         )
@@ -138,8 +146,57 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         mK: cute.Tensor,
         mV: cute.Tensor,
         mO: cute.Tensor,
+        mLSE: cute.Tensor,
         softmax_scale: cutlass.Float32,
+        SharedStorage: cutlass.Constexpr,
     ) -> None:
+        tile_scheduler = SingleTileScheduler.create()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        tile_m_idx, head_q_idx, batch_idx, _ = work_tile.tile_idx
+
+        num_head_q = mQ.shape[2]
+        num_head_kv = mK.shape[2]
+        qhead_per_kvhead = num_head_q // num_head_kv
+        head_kv_idx = head_q_idx // qhead_per_kvhead
+
+        gQ = cute.local_tile(
+            mQ[batch_idx, None, head_q_idx, None],
+            (self.tile_m, self.headdim_qk),
+            (tile_m_idx, 0),
+        )
+        gK = cute.local_tile(
+            mK[batch_idx, None, head_kv_idx, None],
+            (self.tile_n, self.headdim_qk),
+            (None, 0),
+        )
+        gV = cute.local_tile(
+            mV[batch_idx, None, head_kv_idx, None],
+            (self.tile_n, self.headdim_v),
+            (None, 0),
+        )
+        gO = cute.local_tile(
+            mO[batch_idx, None, head_q_idx, None],
+            (self.tile_m, self.headdim_v),
+            (tile_m_idx, 0),
+        )
+        gLSE = cute.local_tile(
+            mLSE[batch_idx, head_q_idx, None],
+            (self.tile_m,),
+            (tile_m_idx,),
+        )
+
+        assert cute.rank(gQ) == cute.rank(gO) == 2
+        assert cute.rank(gK) == cute.rank(gV) == 3
+        assert cute.rank(gLSE) == 1
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sQ = storage.sQ.get_tensor(self.sQ_layout)
+        sK = storage.sK.get_tensor(self.sK_layout)
+        sV = storage.sV.get_tensor(self.sV_layout)
+
+        assert cute.rank(sQ) == 2
+        assert cute.rank(sK) == cute.rank(sV) == 3
         raise NotImplementedError
 
 
@@ -154,23 +211,29 @@ def check_compile(fa_fwd: FlashAttentionForwardM16N8K16SM120):
     }
     mQ = make_tensor(
         fa_fwd.dtype,
-        (1, fa_fwd.tile_m, 1, fa_fwd.headdim_qk),
+        (1, fa_fwd.tile_m, fa_fwd.head_q, fa_fwd.headdim_qk),
         **tensor_options,
     )
     mK = make_tensor(
         fa_fwd.dtype,
-        (1, fa_fwd.tile_n, 1, fa_fwd.headdim_qk),
+        (1, fa_fwd.tile_n, fa_fwd.head_kv, fa_fwd.headdim_qk),
         **tensor_options,
     )
     mV = make_tensor(
         fa_fwd.dtype,
-        (1, fa_fwd.tile_n, 1, fa_fwd.headdim_v),
+        (1, fa_fwd.tile_n, fa_fwd.head_kv, fa_fwd.headdim_v),
         **tensor_options,
     )
     mO = make_tensor(
         fa_fwd.dtype,
-        (1, fa_fwd.tile_m, 1, fa_fwd.headdim_v),
+        (1, fa_fwd.tile_m, fa_fwd.head_q, fa_fwd.headdim_v),
         **tensor_options,
+    )
+    mLSE = make_tensor(
+        cutlass.Float32,
+        (1, fa_fwd.head_q, fa_fwd.tile_m),
+        stride_order=(2, 1, 0),
+        assumed_align=16,
     )
     compile_options = (cute.GPUArch("sm_120a"), cute.EnableTVMFFI)
     return cute.compile[compile_options](
@@ -179,5 +242,6 @@ def check_compile(fa_fwd: FlashAttentionForwardM16N8K16SM120):
         mK,
         mV,
         mO,
+        mLSE,
         cutlass.Float32(1.0),
     )
