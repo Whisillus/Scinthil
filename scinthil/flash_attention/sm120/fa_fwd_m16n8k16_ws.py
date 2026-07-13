@@ -5,6 +5,7 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync
 
 from .fa_fwd_base import FlashAttentionForwardBase
+from .fa_utils import get_predicate_load_v_seqlen
 from .tile_scheduler import SingleTileScheduler
 
 
@@ -180,10 +181,13 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         self,
         gQ: cute.Tensor,
         gK: cute.Tensor,
+        gV: cute.Tensor,
         sQ: cute.Tensor,
         sK: cute.Tensor,
+        sV: cute.Tensor,
         tiled_copy_q: cute.TiledCopy,
         tiled_copy_k: cute.TiledCopy,
+        tiled_copy_v: cute.TiledCopy,
         tile_m_idx: cutlass.Int32,
         seqlen_q: cutlass.Int32,
         seqlen_k: cutlass.Int32,
@@ -207,6 +211,13 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
 
         cK = cute.make_identity_tensor((self.tile_n, self.headdim_qk))
         tKcK = k_thr_copy.partition_S(cK)
+
+        v_thr_copy = tiled_copy_v.get_slice(producer_thread_idx)
+        tVgV = v_thr_copy.partition_S(gV)
+        tVsV = v_thr_copy.partition_D(sV)
+
+        cV = cute.make_identity_tensor((self.tile_n, self.headdim_v))
+        tVcV = v_thr_copy.partition_S(cV)
 
         q_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_q)
         k_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_k)
@@ -237,7 +248,17 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             k_pipeline.producer_commit(k_producer_state)
             k_producer_state.advance()
 
+            # PV consumes the full V tile; zfill prevents stale or NaN SMEM values
+            # from propagating through 0 * NaN at masked sequence positions.
+            tVpV = get_predicate_load_v_seqlen(tVcV, tile_n_idx, seqlen_k, self.tile_n)
+
             v_pipeline.producer_acquire(v_producer_state)
+            cute.copy(
+                tiled_copy_v,
+                tVgV[None, None, None, tile_n_idx],
+                tVsV[None, None, None, v_producer_state.index],
+                pred=tVpV,
+            )
             v_pipeline.producer_commit(v_producer_state)
             v_producer_state.advance()
 
@@ -312,6 +333,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             self.sV_layout,
             self.tiled_copy_q,
             self.tiled_copy_k,
+            self.tiled_copy_v,
             SharedStorage,
         ).launch(
             grid=grid,
@@ -332,6 +354,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         sV_layout: cute.ComposedLayout,
         tiled_copy_q: cute.TiledCopy,
         tiled_copy_k: cute.TiledCopy,
+        tiled_copy_v: cute.TiledCopy,
         SharedStorage: cutlass.Constexpr,
     ) -> None:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -412,10 +435,13 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             self.load(
                 gQ,
                 gK,
+                gV,
                 sQ,
                 sK,
+                sV,
                 tiled_copy_q,
                 tiled_copy_k,
+                tiled_copy_v,
                 tile_m_idx,
                 mQ.shape[1],
                 mK.shape[1],

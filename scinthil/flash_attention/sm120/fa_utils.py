@@ -80,6 +80,30 @@ def get_predicate_load_q_seqlen_headdim(
     return tQpQ
 
 
+@cute.jit
+def get_predicate_load_v_seqlen(
+    tVcV: cute.Tensor,
+    tile_n_idx: cutlass.Int32,
+    seqlen_k: cutlass.Int32,
+    tile_n: cutlass.Constexpr,
+) -> cute.Tensor:
+    v_pred_layout = cute.make_layout(
+        (
+            cute.size(tVcV, mode=[0, 1]),
+            cute.size(tVcV, mode=[1]),
+            cute.size(tVcV, mode=[2]),
+        ),
+        stride=(0, 1, 0),
+    )
+    tVpV = cute.make_rmem_tensor(v_pred_layout, cutlass.Boolean)
+    for v_row in cutlass.range_constexpr(tVpV.shape[1]):
+        tVpV[0, v_row, 0] = cute.elem_less(
+            tile_n_idx * tile_n + tVcV[(0, 0), v_row, 0][0],
+            seqlen_k,
+        )
+    return tVpV
+
+
 def make_acc_tensor_mn_view(acc: cute.Tensor) -> cute.Tensor:
     compact_shape = acc.layout.shape
     # CuTe's default compact layout supplies the canonical strides used to
