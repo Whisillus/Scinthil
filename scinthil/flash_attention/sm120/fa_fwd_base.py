@@ -46,10 +46,10 @@ class FlashAttentionForwardBase:
     def get_smem_layout(self) -> None:
         raise NotImplementedError
 
-    def get_load_qkv_atom(self) -> None:
+    def get_qkv_load_atom(self) -> None:
         raise NotImplementedError
 
-    def get_load_qkv(self) -> None:
+    def get_qkv_load(self) -> None:
         raise NotImplementedError
 
     def get_qk_pv_mma_atom(self) -> None:

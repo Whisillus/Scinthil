@@ -5,6 +5,7 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync
 
 from .fa_fwd_base import FlashAttentionForwardBase
+from .fa_utils import get_predicate_load_q_seqlen
 from .tile_scheduler import SingleTileScheduler
 
 
@@ -113,7 +114,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             permutation_mnk=permutation_mnk,
         )
 
-    def get_load_qkv_atom(self) -> None:
+    def get_qkv_load_atom(self) -> None:
         self.num_bits_per_copy = 128
         self.load_q_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -131,8 +132,8 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             num_bits_per_copy=self.num_bits_per_copy,
         )
 
-    def get_load_qkv(self) -> None:
-        self.get_load_qkv_atom()
+    def get_qkv_load(self) -> None:
+        self.get_qkv_load_atom()
 
         copy_elems = self.num_bits_per_copy // self.dtype.width
         producer_threads = self.num_producer * cute.arch.WARP_SIZE
@@ -168,16 +169,31 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
     @cute.jit
     def load(
         self,
+        gQ: cute.Tensor,
+        sQ: cute.Tensor,
+        tiled_copy_q: cute.TiledCopy,
+        tile_m_idx: cutlass.Int32,
+        seqlen_q: cutlass.Int32,
         num_tile_n: cutlass.Int32,
         q_pipeline: pipeline.PipelineCpAsync,
         k_pipeline: pipeline.PipelineCpAsync,
         v_pipeline: pipeline.PipelineCpAsync,
     ) -> None:
+        producer_thread_idx = cute.arch.thread_idx()[0] - self.num_consumer * cute.arch.WARP_SIZE
+        q_thr_copy = tiled_copy_q.get_slice(producer_thread_idx)
+        tQgQ = q_thr_copy.partition_S(gQ)
+        tQsQ = q_thr_copy.partition_D(sQ)
+
+        cQ = cute.make_identity_tensor((self.tile_m, self.headdim_qk))
+        tQcQ = q_thr_copy.partition_S(cQ)
+        tQpQ = get_predicate_load_q_seqlen(tQcQ, tile_m_idx, seqlen_q, self.tile_m)
+
         q_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_q)
         k_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_k)
         v_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_v)
 
         q_pipeline.producer_acquire(q_producer_state)
+        cute.copy(tiled_copy_q, tQgQ, tQsQ, pred=tQpQ)
         q_pipeline.producer_commit(q_producer_state)
         q_producer_state.advance()
 
@@ -231,7 +247,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
     ) -> None:
         self.get_smem_layout()
         self.get_qk_pv_tiled_mma()
-        self.get_load_qkv()
+        self.get_qkv_load()
 
         @cute.struct
         class SharedStorage:
@@ -259,6 +275,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
+            self.tiled_copy_q,
             SharedStorage,
         ).launch(
             grid=grid,
@@ -277,6 +294,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
+        tiled_copy_q: cute.TiledCopy,
         SharedStorage: cutlass.Constexpr,
     ) -> None:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -354,7 +372,17 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
 
         num_tile_n = cute.size(gK.shape[2])
         if is_producer:
-            self.load(num_tile_n, q_pipeline, k_pipeline, v_pipeline)
+            self.load(
+                gQ,
+                sQ,
+                tiled_copy_q,
+                tile_m_idx,
+                mQ.shape[1],
+                num_tile_n,
+                q_pipeline,
+                k_pipeline,
+                v_pipeline,
+            )
         if is_consumer:
             self.compute(num_tile_n, q_pipeline, k_pipeline, v_pipeline)
 
