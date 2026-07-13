@@ -5,7 +5,6 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync
 
 from .fa_fwd_base import FlashAttentionForwardBase
-from .fa_utils import get_predicate_load_q_seqlen
 from .tile_scheduler import SingleTileScheduler
 
 
@@ -140,7 +139,21 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         value_layout = cute.make_layout((1, copy_elems))
 
         q_vectors_per_row = self.sQ_layout_atom.outer.shape[1] // copy_elems
+        k_vectors_per_row = self.sK_layout_atom.outer.shape[1] // copy_elems
+        v_vectors_per_row = self.sV_layout_atom.outer.shape[1] // copy_elems
+
+        assert producer_threads % q_vectors_per_row == 0, "Producer threads must cover complete Q rows"
+        assert producer_threads % k_vectors_per_row == 0, "Producer threads must cover complete K rows"
+        assert producer_threads % v_vectors_per_row == 0, "Producer threads must cover complete V rows"
+
         q_rows_per_copy = producer_threads // q_vectors_per_row
+        k_rows_per_copy = producer_threads // k_vectors_per_row
+        v_rows_per_copy = producer_threads // v_vectors_per_row
+
+        assert self.tile_m % q_rows_per_copy == 0, "Q copy rows must evenly divide tile_m"
+        assert self.tile_n % k_rows_per_copy == 0, "K copy rows must evenly divide tile_n"
+        assert self.tile_n % v_rows_per_copy == 0, "V copy rows must evenly divide tile_n"
+
         q_thread_layout = cute.make_layout((q_rows_per_copy, q_vectors_per_row), stride=(q_vectors_per_row, 1))
         self.tiled_copy_q = cute.make_tiled_copy_tv(
             self.load_q_atom,
@@ -148,8 +161,6 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             value_layout,
         )
 
-        k_vectors_per_row = self.sK_layout_atom.outer.shape[1] // copy_elems
-        k_rows_per_copy = producer_threads // k_vectors_per_row
         k_thread_layout = cute.make_layout((k_rows_per_copy, k_vectors_per_row), stride=(k_vectors_per_row, 1))
         self.tiled_copy_k = cute.make_tiled_copy_tv(
             self.load_k_atom,
@@ -157,8 +168,6 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             value_layout,
         )
 
-        v_vectors_per_row = self.sV_layout_atom.outer.shape[1] // copy_elems
-        v_rows_per_copy = producer_threads // v_vectors_per_row
         v_thread_layout = cute.make_layout((v_rows_per_copy, v_vectors_per_row), stride=(v_vectors_per_row, 1))
         self.tiled_copy_v = cute.make_tiled_copy_tv(
             self.load_v_atom,
@@ -170,35 +179,61 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
     def load(
         self,
         gQ: cute.Tensor,
+        gK: cute.Tensor,
         sQ: cute.Tensor,
+        sK: cute.Tensor,
         tiled_copy_q: cute.TiledCopy,
+        tiled_copy_k: cute.TiledCopy,
         tile_m_idx: cutlass.Int32,
         seqlen_q: cutlass.Int32,
+        seqlen_k: cutlass.Int32,
         num_tile_n: cutlass.Int32,
         q_pipeline: pipeline.PipelineCpAsync,
         k_pipeline: pipeline.PipelineCpAsync,
         v_pipeline: pipeline.PipelineCpAsync,
     ) -> None:
         producer_thread_idx = cute.arch.thread_idx()[0] - self.num_consumer * cute.arch.WARP_SIZE
+
         q_thr_copy = tiled_copy_q.get_slice(producer_thread_idx)
         tQgQ = q_thr_copy.partition_S(gQ)
         tQsQ = q_thr_copy.partition_D(sQ)
 
         cQ = cute.make_identity_tensor((self.tile_m, self.headdim_qk))
         tQcQ = q_thr_copy.partition_S(cQ)
-        tQpQ = get_predicate_load_q_seqlen(tQcQ, tile_m_idx, seqlen_q, self.tile_m)
+
+        k_thr_copy = tiled_copy_k.get_slice(producer_thread_idx)
+        tKgK = k_thr_copy.partition_S(gK)
+        tKsK = k_thr_copy.partition_D(sK)
+
+        cK = cute.make_identity_tensor((self.tile_n, self.headdim_qk))
+        tKcK = k_thr_copy.partition_S(cK)
 
         q_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_q)
         k_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_k)
         v_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_v)
 
         q_pipeline.producer_acquire(q_producer_state)
-        cute.copy(tiled_copy_q, tQgQ, tQsQ, pred=tQpQ)
+        for q_row in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
+            q_row_coord = tQcQ[(0, 0), q_row, 0][0]
+            if cute.elem_less(tile_m_idx * self.tile_m + q_row_coord, seqlen_q):
+                cute.copy(
+                    tiled_copy_q,
+                    tQgQ[None, q_row, None],
+                    tQsQ[None, q_row, None],
+                )
         q_pipeline.producer_commit(q_producer_state)
         q_producer_state.advance()
 
-        for _ in cutlass.range(0, num_tile_n, 1):
+        for tile_n_idx in cutlass.range(0, num_tile_n, 1):
             k_pipeline.producer_acquire(k_producer_state)
+            for k_row in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                k_row_coord = tKcK[(0, 0), k_row, 0][0]
+                if cute.elem_less(tile_n_idx * self.tile_n + k_row_coord, seqlen_k):
+                    cute.copy(
+                        tiled_copy_k,
+                        tKgK[None, k_row, None, tile_n_idx],
+                        tKsK[None, k_row, None, k_producer_state.index],
+                    )
             k_pipeline.producer_commit(k_producer_state)
             k_producer_state.advance()
 
@@ -276,6 +311,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             self.sK_layout,
             self.sV_layout,
             self.tiled_copy_q,
+            self.tiled_copy_k,
             SharedStorage,
         ).launch(
             grid=grid,
@@ -295,6 +331,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
         tiled_copy_q: cute.TiledCopy,
+        tiled_copy_k: cute.TiledCopy,
         SharedStorage: cutlass.Constexpr,
     ) -> None:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -374,10 +411,14 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         if is_producer:
             self.load(
                 gQ,
+                gK,
                 sQ,
+                sK,
                 tiled_copy_q,
+                tiled_copy_k,
                 tile_m_idx,
                 mQ.shape[1],
+                mK.shape[1],
                 num_tile_n,
                 q_pipeline,
                 k_pipeline,

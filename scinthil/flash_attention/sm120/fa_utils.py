@@ -27,6 +27,29 @@ def get_predicate_load_q_seqlen(
 
 
 @cute.jit
+def get_predicate_load_q_headdim(
+    tQcQ: cute.Tensor,
+    headdim_qk: cutlass.Int32,
+) -> cute.Tensor:
+    q_pred_layout = cute.make_layout(
+        (
+            cute.size(tQcQ, mode=[0, 1]),
+            cute.size(tQcQ, mode=[1]),
+            cute.size(tQcQ, mode=[2]),
+        ),
+        stride=(cute.size(tQcQ, mode=[2]), 0, 1),
+    )
+    tQpQ = cute.make_rmem_tensor(q_pred_layout, cutlass.Boolean)
+    for atom_rest in cutlass.range_constexpr(tQpQ.shape[0]):
+        for q_k in cutlass.range_constexpr(tQpQ.shape[2]):
+            tQpQ[atom_rest, 0, q_k] = cute.elem_less(
+                tQcQ[(0, atom_rest), 0, q_k][1],
+                headdim_qk,
+            )
+    return tQpQ
+
+
+@cute.jit
 def get_predicate_load_q_seqlen_headdim(
     tQcQ: cute.Tensor,
     tile_m_idx: cutlass.Int32,
