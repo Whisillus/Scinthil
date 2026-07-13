@@ -176,6 +176,28 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             value_layout,
         )
 
+    def get_qkv_s2r_atom(self) -> None:
+        # CuTe MMA uses A(M,K) and B(N,K): Q(M,D) and K(N,D) already
+        # match those views, while V(K,Dv) must transpose into B(Dv,K).
+        self.s2r_q_atom = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            self.dtype,
+        )
+        self.s2r_k_atom = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            self.dtype,
+        )
+        self.s2r_v_atom = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+            self.dtype,
+        )
+
+    def get_qkv_s2r(self) -> None:
+        self.get_qkv_s2r_atom()
+        self.tiled_copy_q_s2r = cute.make_tiled_copy_A(self.s2r_q_atom, self.tiled_mma_qk)
+        self.tiled_copy_k_s2r = cute.make_tiled_copy_B(self.s2r_k_atom, self.tiled_mma_qk)
+        self.tiled_copy_v_s2r = cute.make_tiled_copy_B(self.s2r_v_atom, self.tiled_mma_pv)
+
     @cute.jit
     def load(
         self,
@@ -304,6 +326,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         self.get_smem_layout()
         self.get_qk_pv_tiled_mma()
         self.get_qkv_load()
+        self.get_qkv_s2r()
 
         @cute.struct
         class SharedStorage:

@@ -52,6 +52,12 @@ class FlashAttentionForwardBase:
     def get_qkv_load(self) -> None:
         raise NotImplementedError
 
+    def get_qkv_s2r_atom(self) -> None:
+        raise NotImplementedError
+
+    def get_qkv_s2r(self) -> None:
+        raise NotImplementedError
+
     def get_qk_pv_mma_atom(self) -> None:
         raise NotImplementedError
 
