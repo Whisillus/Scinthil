@@ -5,7 +5,9 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync
 
 from .fa_fwd_base import FlashAttentionForwardBase
-from .fa_utils import get_predicate_load_v_seqlen
+from .fa_utils import get_log2, get_predicate_load_v_seqlen
+from .mask import FlashAttentionMaskSM120
+from .softmax import FlashAttentionSoftmaxSM120
 from .tile_scheduler import SingleTileScheduler
 
 
@@ -30,9 +32,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
     def can_implement(self) -> bool:
         if self.dtype not in (cutlass.Float16, cutlass.BFloat16):
             return False
-        if self.acc_dtype not in (cutlass.Float16, cutlass.Float32):
-            return False
-        if self.dtype == cutlass.BFloat16 and self.acc_dtype != cutlass.Float32:
+        if self.acc_dtype != cutlass.Float32:
             return False
         if self.head_q <= 0 or self.head_kv <= 0:
             return False
@@ -304,8 +304,13 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         sQ: cute.Tensor,
         sK: cute.Tensor,
         tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
         tiled_copy_q_s2r: cute.TiledCopy,
         tiled_copy_k_s2r: cute.TiledCopy,
+        tile_m_idx: cutlass.Int32,
+        seqlen_q: cutlass.Int32,
+        seqlen_k: cutlass.Int32,
+        softmax_scale_log2: cutlass.Float32,
         num_tile_n: cutlass.Int32,
         q_pipeline: pipeline.PipelineCpAsync,
         k_pipeline: pipeline.PipelineCpAsync,
@@ -314,10 +319,13 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         consumer_thread_idx = cute.arch.thread_idx()[0]
 
         qk_thr_mma = tiled_mma_qk.get_slice(consumer_thread_idx)
+        pv_thr_mma = tiled_mma_pv.get_slice(consumer_thread_idx)
         sQ_qk_block = cute.local_tile(sQ, (self.tile_m, self.mma_inst_k), (0, 0))
         sK_qk_block = cute.local_tile(sK[None, None, 0], (self.tile_n, self.mma_inst_k), (0, 0))
-        tCrQ = qk_thr_mma.make_fragment_A(qk_thr_mma.partition_A(sQ_qk_block))
-        tCrK = qk_thr_mma.make_fragment_B(qk_thr_mma.partition_B(sK_qk_block))
+        tCsQ = qk_thr_mma.partition_A(sQ_qk_block)
+        tCsK = qk_thr_mma.partition_B(sK_qk_block)
+        tCrQ = qk_thr_mma.make_fragment_A(tCsQ)
+        tCrK = qk_thr_mma.make_fragment_B(tCsK)
 
         q_thr_copy = tiled_copy_q_s2r.get_slice(consumer_thread_idx)
         tQsQ = q_thr_copy.partition_S(sQ)
@@ -329,12 +337,21 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
 
         assert cute.size(tQsQ.shape[2]) == cute.size(tKsK.shape[2])
 
+        acc_shape_o = pv_thr_mma.partition_shape_C((self.tile_m, self.headdim_v))
+        acc_o = cute.make_rmem_tensor(acc_shape_o, self.acc_dtype)
+        acc_o.fill(0.0)
+
+        num_rows = acc_o.shape[0][0] * acc_o.shape[1]
+        softmax = FlashAttentionSoftmaxSM120.create(softmax_scale_log2, num_rows)
+
+        score_mask = FlashAttentionMaskSM120.create(qk_thr_mma, self.tile_m, self.tile_n, self.is_causal)
+
         q_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_q)
         k_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_k)
         v_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_v)
 
         q_pipeline.consumer_wait(q_consumer_state)
-        for _ in cutlass.range(0, num_tile_n, 1):
+        for tile_n_idx in cutlass.range(0, num_tile_n, 1):
             k_pipeline.consumer_wait(k_consumer_state)
 
             acc_shape_s = qk_thr_mma.partition_shape_C((self.tile_m, self.tile_n))
@@ -363,6 +380,16 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             k_pipeline.consumer_release(k_consumer_state)
             k_consumer_state.advance()
 
+            score_mask.apply(
+                acc_s,
+                tile_m_idx,
+                tile_n_idx,
+                seqlen_q,
+                seqlen_k,
+            )
+            row_scale = softmax.online_softmax(acc_s)
+            softmax.rescale_O(acc_o, row_scale)
+
             v_pipeline.consumer_wait(v_consumer_state)
             v_pipeline.consumer_release(v_consumer_state)
             v_consumer_state.advance()
@@ -387,6 +414,8 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         self.get_qkv_load()
         self.get_qkv_s2r()
 
+        softmax_scale_log2 = softmax_scale * get_log2()
+
         @cute.struct
         class SharedStorage:
             sQ: cute.struct.Align[cute.struct.MemRange[self.dtype, self.sQ_size], 128]
@@ -409,7 +438,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             mV,
             mO,
             mLSE,
-            softmax_scale,
+            softmax_scale_log2,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -417,6 +446,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             self.tiled_copy_k,
             self.tiled_copy_v,
             self.tiled_mma_qk,
+            self.tiled_mma_pv,
             self.tiled_copy_q_s2r,
             self.tiled_copy_k_s2r,
             SharedStorage,
@@ -433,7 +463,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
-        softmax_scale: cutlass.Float32,
+        softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -441,6 +471,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         tiled_copy_k: cute.TiledCopy,
         tiled_copy_v: cute.TiledCopy,
         tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
         tiled_copy_q_s2r: cute.TiledCopy,
         tiled_copy_k_s2r: cute.TiledCopy,
         SharedStorage: cutlass.Constexpr,
@@ -543,8 +574,13 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
                 sQ,
                 sK,
                 tiled_mma_qk,
+                tiled_mma_pv,
                 tiled_copy_q_s2r,
                 tiled_copy_k_s2r,
+                tile_m_idx,
+                mQ.shape[1],
+                mK.shape[1],
+                softmax_scale_log2,
                 num_tile_n,
                 q_pipeline,
                 k_pipeline,

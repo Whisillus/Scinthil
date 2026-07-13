@@ -2,6 +2,10 @@ import cutlass
 import cutlass.cute as cute
 
 
+def get_log2() -> float:
+    return 1.4426950408889634
+
+
 @cute.jit
 def get_predicate_load_q_seqlen(
     tQcQ: cute.Tensor,
