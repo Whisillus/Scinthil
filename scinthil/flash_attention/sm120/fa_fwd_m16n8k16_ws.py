@@ -12,6 +12,21 @@ from .tile_scheduler import SingleTileScheduler
 class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
     """Warp-specialized FlashAttention forward kernel configuration."""
 
+    def get_warpspecialize_config(self) -> None:
+        self.mma_inst_shape_mnk = (16, 8, 16)
+        self.mma_inst_m, self.mma_inst_n, self.mma_inst_k = self.mma_inst_shape_mnk
+        self.mma_warp_tile_shape_mnk = (self.mma_inst_m, 2 * self.mma_inst_n, self.mma_inst_k)
+
+        assert self.tile_m % self.mma_warp_tile_shape_mnk[0] == 0, "tile_m must be divisible by warp MMA tile M"
+        assert self.tile_n % self.mma_warp_tile_shape_mnk[1] == 0, "tile_n must be divisible by warp MMA tile N"
+
+        self.num_producer = 1
+        self.num_consumer = self.tile_m // self.mma_warp_tile_shape_mnk[0]
+        self.threads_per_cta = (self.num_producer + self.num_consumer) * cute.arch.WARP_SIZE
+
+        assert self.num_consumer > 0, "MMA configuration requires at least one consumer warp"
+        assert self.threads_per_cta <= 1024, "MMA configuration exceeds the maximum CTA thread count"
+
     def can_implement(self) -> bool:
         if self.dtype not in (cutlass.Float16, cutlass.BFloat16):
             return False
@@ -25,15 +40,8 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             return False
         if self.headdim_qk % 64 != 0 or self.headdim_v % 64 != 0:
             return False
-        if self.tile_m % 16 != 0 or self.tile_n % 16 != 0:
-            return False
         if self.stage_k <= 0 or self.stage_v <= 0:
             return False
-        if self.num_producer <= 0 or self.num_consumer <= 0:
-            return False
-        if self.threads_per_cta > 1024:
-            return False
-
         smem_usage_q = self.tile_m * self.headdim_qk * self.dtype_byte
         smem_usage_k = self.tile_n * self.headdim_qk * self.stage_k * self.dtype_byte
         smem_usage_v = self.tile_n * self.headdim_v * self.stage_v * self.dtype_byte
@@ -76,24 +84,22 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         self.sV_size = cute.cosize(self.sV_layout)
 
     def get_qk_pv_mma_atom(self) -> None:
-        mma_inst_shape_mnk = (16, 8, 16)
         self.mma_atom_qk = cute.make_mma_atom(
             cute.nvgpu.warp.MmaF16BF16Op(
                 self.dtype,
                 self.acc_dtype,
-                mma_inst_shape_mnk,
+                self.mma_inst_shape_mnk,
             )
         )
         self.mma_atom_pv = cute.make_mma_atom(
             cute.nvgpu.warp.MmaF16BF16Op(
                 self.dtype,
                 self.acc_dtype,
-                mma_inst_shape_mnk,
+                self.mma_inst_shape_mnk,
             )
         )
 
     def get_qk_pv_tiled_mma(self) -> None:
-        self.get_qk_pv_mma_atom()
         atom_shape_mnk = (self.num_consumer, 1, 1)
         atom_stride_mnk = (1, self.num_consumer, self.num_consumer)
         atom_layout_mnk = cute.make_layout(
@@ -102,7 +108,11 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         )
         # Extend the native N=8 atom to N=16 so each warp can load the two
         # adjacent B fragments together with ldmatrix.x4 and reuse A for both MMAs.
-        permutation_mnk = (self.num_consumer * 16, 16, 16)
+        permutation_mnk = (
+            self.num_consumer * self.mma_warp_tile_shape_mnk[0],
+            self.mma_warp_tile_shape_mnk[1],
+            self.mma_warp_tile_shape_mnk[2],
+        )
         self.tiled_mma_qk = cute.make_tiled_mma(
             self.mma_atom_qk,
             atom_layout_mnk,
@@ -291,27 +301,74 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
     @cute.jit
     def compute(
         self,
+        sQ: cute.Tensor,
+        sK: cute.Tensor,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_copy_q_s2r: cute.TiledCopy,
+        tiled_copy_k_s2r: cute.TiledCopy,
         num_tile_n: cutlass.Int32,
         q_pipeline: pipeline.PipelineCpAsync,
         k_pipeline: pipeline.PipelineCpAsync,
         v_pipeline: pipeline.PipelineCpAsync,
     ) -> None:
+        consumer_thread_idx = cute.arch.thread_idx()[0]
+
+        qk_thr_mma = tiled_mma_qk.get_slice(consumer_thread_idx)
+        sQ_qk_block = cute.local_tile(sQ, (self.tile_m, self.mma_inst_k), (0, 0))
+        sK_qk_block = cute.local_tile(sK[None, None, 0], (self.tile_n, self.mma_inst_k), (0, 0))
+        tCrQ = qk_thr_mma.make_fragment_A(qk_thr_mma.partition_A(sQ_qk_block))
+        tCrK = qk_thr_mma.make_fragment_B(qk_thr_mma.partition_B(sK_qk_block))
+
+        q_thr_copy = tiled_copy_q_s2r.get_slice(consumer_thread_idx)
+        tQsQ = q_thr_copy.partition_S(sQ)
+        tQrQ = q_thr_copy.retile(tCrQ)
+
+        k_thr_copy = tiled_copy_k_s2r.get_slice(consumer_thread_idx)
+        tKsK = k_thr_copy.partition_S(sK)
+        tKrK = k_thr_copy.retile(tCrK)
+
+        assert cute.size(tQsQ.shape[2]) == cute.size(tKsK.shape[2])
+
         q_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_q)
         k_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_k)
         v_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_v)
 
         q_pipeline.consumer_wait(q_consumer_state)
-        q_pipeline.consumer_release(q_consumer_state)
-        q_consumer_state.advance()
-
         for _ in cutlass.range(0, num_tile_n, 1):
             k_pipeline.consumer_wait(k_consumer_state)
+
+            acc_shape_s = qk_thr_mma.partition_shape_C((self.tile_m, self.tile_n))
+            acc_s = cute.make_rmem_tensor(acc_shape_s, self.acc_dtype)
+            acc_s.fill(0.0)
+
+            for qk_block in cutlass.range_constexpr(cute.size(tKsK.shape[2])):
+                cute.copy(
+                    tiled_copy_q_s2r,
+                    tQsQ[None, None, qk_block],
+                    tQrQ[None, None, 0],
+                )
+                cute.copy(
+                    tiled_copy_k_s2r,
+                    tKsK[None, None, qk_block, k_consumer_state.index],
+                    tKrK[None, None, 0],
+                )
+                cute.gemm(
+                    tiled_mma_qk,
+                    acc_s,
+                    tCrQ[None, None, 0],
+                    tCrK[None, None, 0],
+                    acc_s,
+                )
+
             k_pipeline.consumer_release(k_consumer_state)
             k_consumer_state.advance()
 
             v_pipeline.consumer_wait(v_consumer_state)
             v_pipeline.consumer_release(v_consumer_state)
             v_consumer_state.advance()
+
+        q_pipeline.consumer_release(q_consumer_state)
+        q_consumer_state.advance()
 
     @cute.jit
     def __call__(
@@ -323,7 +380,9 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         mLSE: cute.Tensor,
         softmax_scale: cutlass.Float32,
     ) -> None:
+        self.get_warpspecialize_config()
         self.get_smem_layout()
+        self.get_qk_pv_mma_atom()
         self.get_qk_pv_tiled_mma()
         self.get_qkv_load()
         self.get_qkv_s2r()
@@ -357,6 +416,9 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             self.tiled_copy_q,
             self.tiled_copy_k,
             self.tiled_copy_v,
+            self.tiled_mma_qk,
+            self.tiled_copy_q_s2r,
+            self.tiled_copy_k_s2r,
             SharedStorage,
         ).launch(
             grid=grid,
@@ -378,6 +440,9 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         tiled_copy_q: cute.TiledCopy,
         tiled_copy_k: cute.TiledCopy,
         tiled_copy_v: cute.TiledCopy,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_copy_q_s2r: cute.TiledCopy,
+        tiled_copy_k_s2r: cute.TiledCopy,
         SharedStorage: cutlass.Constexpr,
     ) -> None:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -474,7 +539,17 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
                 v_pipeline,
             )
         if is_consumer:
-            self.compute(num_tile_n, q_pipeline, k_pipeline, v_pipeline)
+            self.compute(
+                sQ,
+                sK,
+                tiled_mma_qk,
+                tiled_copy_q_s2r,
+                tiled_copy_k_s2r,
+                num_tile_n,
+                q_pipeline,
+                k_pipeline,
+                v_pipeline,
+            )
 
         assert cute.rank(sQ) == 2
         assert cute.rank(sK) == cute.rank(sV) == 3

@@ -1,5 +1,4 @@
 import cutlass
-import cutlass.cute as cute
 
 
 class FlashAttentionForwardBase:
@@ -15,8 +14,6 @@ class FlashAttentionForwardBase:
         stage_k: int = 1,
         stage_v: int = 1,
         is_causal: bool = False,
-        num_producer: int = 1,
-        num_consumer: int = 1,
         acc_dtype=cutlass.Float32,
     ) -> None:
         self.dtype = dtype
@@ -33,9 +30,6 @@ class FlashAttentionForwardBase:
         self.stage_k = stage_k
         self.stage_v = stage_v
         self.is_causal = is_causal
-        self.num_producer = num_producer
-        self.num_consumer = num_consumer
-        self.threads_per_cta = (self.num_producer + self.num_consumer) * cute.arch.WARP_SIZE
 
     def can_implement(self) -> bool:
         raise NotImplementedError
