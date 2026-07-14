@@ -49,6 +49,7 @@ class FlashAttentionSoftmaxSM120:
     def online_softmax(
         self,
         acc_s: cute.Tensor,
+        is_first: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
     ) -> cute.Tensor:
         acc_s_mn = make_acc_tensor_mn_view(acc_s)
@@ -57,8 +58,11 @@ class FlashAttentionSoftmaxSM120:
         for row in cutlass.range_constexpr(cute.size(self.row_max)):
             scores = acc_s_mn[row, None].load()
 
-            prev_row_max = self.row_max[row]
-            curr_row_max = fmax_reduce(scores, prev_row_max)
+            if cutlass.const_expr(is_first):
+                curr_row_max = fmax_reduce(scores, -cutlass.Float32.inf)
+            else:
+                prev_row_max = self.row_max[row]
+                curr_row_max = fmax_reduce(scores, prev_row_max)
             curr_row_max = cute.arch.warp_reduction_max(
                 curr_row_max,
                 threads_in_group=4,
@@ -67,18 +71,22 @@ class FlashAttentionSoftmaxSM120:
             self.row_max[row] = curr_row_max
             if cutlass.const_expr(check_inf):
                 curr_row_max = 0.0 if curr_row_max == -cutlass.Float32.inf else curr_row_max
-            correction = cute.math.exp2(
-                (prev_row_max - curr_row_max) * self.softmax_scale_log2,
-                fastmath=True,
-            )
             probabilities = cute.math.exp2(
                 scores * self.softmax_scale_log2 - curr_row_max * self.softmax_scale_log2,
                 fastmath=True,
             )
-            curr_row_sum = fadd_reduce(
-                probabilities,
-                self.row_sum[row] * correction,
-            )
+            if cutlass.const_expr(is_first):
+                correction = 1.0
+                curr_row_sum = fadd_reduce(probabilities, cutlass.Float32.zero)
+            else:
+                correction = cute.math.exp2(
+                    (prev_row_max - curr_row_max) * self.softmax_scale_log2,
+                    fastmath=True,
+                )
+                curr_row_sum = fadd_reduce(
+                    probabilities,
+                    self.row_sum[row] * correction,
+                )
 
             row_scale[row] = correction
             self.row_sum[row] = curr_row_sum
