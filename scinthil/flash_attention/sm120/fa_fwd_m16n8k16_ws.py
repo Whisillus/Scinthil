@@ -6,7 +6,7 @@ from cutlass.cute.nvgpu import cpasync
 
 from .block import BlockInfo
 from .fa_fwd_base import FlashAttentionForwardBase
-from .fa_utils import get_log2, get_predicate_load_v_seqlen, transform_frg_P
+from .fa_utils import get_log2, get_predicate_load_v_seqlen, make_acc_tensor_mn_view, transform_frg_P
 from .mask import FlashAttentionMaskSM120
 from .softmax import FlashAttentionSoftmaxSM120
 from .tile_scheduler import SingleTileScheduler
@@ -257,48 +257,49 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         k_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_k)
         v_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.stage_v)
 
-        q_pipeline.producer_acquire(q_producer_state)
-        for q_row in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
-            q_row_coord = tQcQ[(0, 0), q_row, 0][0]
-            if cute.elem_less(tile_m_idx * self.tile_m + q_row_coord, seqlen_q):
-                cute.copy(
-                    tiled_copy_q,
-                    tQgQ[None, q_row, None],
-                    tQsQ[None, q_row, None],
-                )
-        q_pipeline.producer_commit(q_producer_state)
-        q_producer_state.advance()
-
-        for tile_n_idx in cutlass.range(n_block_max - 1, n_block_min - 1, -1):
-            k_pipeline.producer_acquire(k_producer_state)
-            for k_row in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                k_row_coord = tKcK[(0, 0), k_row, 0][0]
-                if cute.elem_less(tile_n_idx * self.tile_n + k_row_coord, seqlen_k):
+        if n_block_min < n_block_max:
+            q_pipeline.producer_acquire(q_producer_state)
+            for q_row in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
+                q_row_coord = tQcQ[(0, 0), q_row, 0][0]
+                if cute.elem_less(tile_m_idx * self.tile_m + q_row_coord, seqlen_q):
                     cute.copy(
-                        tiled_copy_k,
-                        tKgK[None, k_row, None, tile_n_idx],
-                        tKsK[None, k_row, None, k_producer_state.index],
+                        tiled_copy_q,
+                        tQgQ[None, q_row, None],
+                        tQsQ[None, q_row, None],
                     )
-            k_pipeline.producer_commit(k_producer_state)
-            k_producer_state.advance()
+            q_pipeline.producer_commit(q_producer_state)
+            q_producer_state.advance()
 
-            # PV consumes the full V tile; zfill prevents stale or NaN SMEM values
-            # from propagating through 0 * NaN at masked sequence positions.
-            tVpV = get_predicate_load_v_seqlen(tVcV, tile_n_idx, seqlen_k, self.tile_n)
+            for tile_n_idx in cutlass.range(n_block_max - 1, n_block_min - 1, -1):
+                k_pipeline.producer_acquire(k_producer_state)
+                for k_row in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                    k_row_coord = tKcK[(0, 0), k_row, 0][0]
+                    if cute.elem_less(tile_n_idx * self.tile_n + k_row_coord, seqlen_k):
+                        cute.copy(
+                            tiled_copy_k,
+                            tKgK[None, k_row, None, tile_n_idx],
+                            tKsK[None, k_row, None, k_producer_state.index],
+                        )
+                k_pipeline.producer_commit(k_producer_state)
+                k_producer_state.advance()
 
-            v_pipeline.producer_acquire(v_producer_state)
-            cute.copy(
-                tiled_copy_v,
-                tVgV[None, None, None, tile_n_idx],
-                tVsV[None, None, None, v_producer_state.index],
-                pred=tVpV,
-            )
-            v_pipeline.producer_commit(v_producer_state)
-            v_producer_state.advance()
+                # PV consumes the full V tile; zfill prevents stale or NaN SMEM values
+                # from propagating through 0 * NaN at masked sequence positions.
+                tVpV = get_predicate_load_v_seqlen(tVcV, tile_n_idx, seqlen_k, self.tile_n)
 
-        q_pipeline.producer_tail(q_producer_state)
-        k_pipeline.producer_tail(k_producer_state)
-        v_pipeline.producer_tail(v_producer_state)
+                v_pipeline.producer_acquire(v_producer_state)
+                cute.copy(
+                    tiled_copy_v,
+                    tVgV[None, None, None, tile_n_idx],
+                    tVsV[None, None, None, v_producer_state.index],
+                    pred=tVpV,
+                )
+                v_pipeline.producer_commit(v_producer_state)
+                v_producer_state.advance()
+
+            q_pipeline.producer_tail(q_producer_state)
+            k_pipeline.producer_tail(k_producer_state)
+            v_pipeline.producer_tail(v_producer_state)
 
     @cute.jit
     def compute_step(
@@ -401,6 +402,41 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         return k_consumer_state, v_consumer_state
 
     @cute.jit
+    def epilogue(
+        self,
+        acc_o: cute.Tensor,
+        lse: cute.Tensor,
+        tiled_mma_pv: cute.TiledMma,
+        gO: cute.Tensor,
+        gLSE: cute.Tensor,
+        tile_m_idx: cutlass.Int32,
+        seqlen_q: cutlass.Int32,
+    ) -> None:
+        consumer_thread_idx = cute.arch.thread_idx()[0]
+        pv_thr_mma = tiled_mma_pv.get_slice(consumer_thread_idx)
+
+        rO = cute.make_fragment_like(acc_o, self.dtype)
+        rO.store(acc_o.load().to(self.dtype))
+
+        cO = cute.make_identity_tensor((self.tile_m, self.headdim_v))
+        tOgO_mn = make_acc_tensor_mn_view(pv_thr_mma.partition_C(gO))
+        tOcO_mn = make_acc_tensor_mn_view(pv_thr_mma.partition_C(cO))
+        tOrO_mn = make_acc_tensor_mn_view(rO)
+
+        assert cute.size(tOrO_mn, mode=[0]) == cute.size(lse)
+
+        for row in cutlass.range_constexpr(cute.size(tOrO_mn, mode=[0])):
+            row_idx = tOcO_mn[row, 0][0]
+            if cute.elem_less(tile_m_idx * self.tile_m + row_idx, seqlen_q):
+                cute.autovec_copy(tOrO_mn[row, None], tOgO_mn[row, None])
+
+        if tOcO_mn[0, 0][1] == 0:
+            for row in cutlass.range_constexpr(cute.size(lse)):
+                row_idx = tOcO_mn[row, 0][0]
+                if cute.elem_less(tile_m_idx * self.tile_m + row_idx, seqlen_q):
+                    gLSE[row_idx] = lse[row]
+
+    @cute.jit
     def compute(
         self,
         sQ: cute.Tensor,
@@ -420,7 +456,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         q_pipeline: pipeline.PipelineCpAsync,
         k_pipeline: pipeline.PipelineCpAsync,
         v_pipeline: pipeline.PipelineCpAsync,
-    ) -> None:
+    ) -> tuple[cute.Tensor, cute.Tensor]:
         consumer_thread_idx = cute.arch.thread_idx()[0]
 
         qk_thr_mma = tiled_mma_qk.get_slice(consumer_thread_idx)
@@ -474,39 +510,9 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         k_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_k)
         v_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.stage_v)
 
-        q_pipeline.consumer_wait(q_consumer_state)
-        tile_n_idx = n_block_max - 1
-        k_consumer_state, v_consumer_state = self.compute_step(
-            qk_thr_mma,
-            tiled_mma_qk,
-            tiled_mma_pv,
-            tiled_copy_q_s2r,
-            tiled_copy_k_s2r,
-            tiled_copy_v_s2r,
-            tQsQ,
-            tQrQ,
-            tKsK,
-            tKrK,
-            tVsVt,
-            tVrV,
-            tCrQ,
-            tCrK,
-            tCrV,
-            acc_o,
-            softmax,
-            score_mask,
-            tile_m_idx,
-            tile_n_idx,
-            seqlen_q,
-            seqlen_k,
-            k_pipeline,
-            v_pipeline,
-            k_consumer_state,
-            v_consumer_state,
-            is_first_n_block=True,
-        )
-
-        for tile_n_idx in cutlass.range(n_block_max - 2, n_block_min - 1, -1):
+        if n_block_min < n_block_max:
+            q_pipeline.consumer_wait(q_consumer_state)
+            tile_n_idx = n_block_max - 1
             k_consumer_state, v_consumer_state = self.compute_step(
                 qk_thr_mma,
                 tiled_mma_qk,
@@ -534,13 +540,46 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
                 v_pipeline,
                 k_consumer_state,
                 v_consumer_state,
-                is_first_n_block=False,
+                is_first_n_block=True,
             )
 
-        q_pipeline.consumer_release(q_consumer_state)
-        q_consumer_state.advance()
+            for tile_n_idx in cutlass.range(n_block_max - 2, n_block_min - 1, -1):
+                k_consumer_state, v_consumer_state = self.compute_step(
+                    qk_thr_mma,
+                    tiled_mma_qk,
+                    tiled_mma_pv,
+                    tiled_copy_q_s2r,
+                    tiled_copy_k_s2r,
+                    tiled_copy_v_s2r,
+                    tQsQ,
+                    tQrQ,
+                    tKsK,
+                    tKrK,
+                    tVsVt,
+                    tVrV,
+                    tCrQ,
+                    tCrK,
+                    tCrV,
+                    acc_o,
+                    softmax,
+                    score_mask,
+                    tile_m_idx,
+                    tile_n_idx,
+                    seqlen_q,
+                    seqlen_k,
+                    k_pipeline,
+                    v_pipeline,
+                    k_consumer_state,
+                    v_consumer_state,
+                    is_first_n_block=False,
+                )
+
+            q_pipeline.consumer_release(q_consumer_state)
+            q_consumer_state.advance()
+
         final_scale = softmax.compute_final_scale()
         softmax.rescale_O(acc_o, final_scale)
+        return acc_o, softmax.row_sum
 
     @cute.jit
     def __call__(
@@ -698,47 +737,55 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
 
         block_info = BlockInfo(self.tile_m, self.tile_n, self.is_causal)
         n_block_min, n_block_max = block_info.get_n_block_min_max(mQ.shape[1], mK.shape[1], tile_m_idx)
-        if n_block_min < n_block_max:
-            if is_producer:
-                self.load(
-                    gQ,
-                    gK,
-                    gV,
-                    sQ,
-                    sK,
-                    sV,
-                    tiled_copy_q,
-                    tiled_copy_k,
-                    tiled_copy_v,
-                    tile_m_idx,
-                    mQ.shape[1],
-                    mK.shape[1],
-                    n_block_min,
-                    n_block_max,
-                    q_pipeline,
-                    k_pipeline,
-                    v_pipeline,
-                )
-            if is_consumer:
-                self.compute(
-                    sQ,
-                    sK,
-                    sV,
-                    tiled_mma_qk,
-                    tiled_mma_pv,
-                    tiled_copy_q_s2r,
-                    tiled_copy_k_s2r,
-                    tiled_copy_v_s2r,
-                    tile_m_idx,
-                    mQ.shape[1],
-                    mK.shape[1],
-                    softmax_scale_log2,
-                    n_block_min,
-                    n_block_max,
-                    q_pipeline,
-                    k_pipeline,
-                    v_pipeline,
-                )
+        if is_producer:
+            self.load(
+                gQ,
+                gK,
+                gV,
+                sQ,
+                sK,
+                sV,
+                tiled_copy_q,
+                tiled_copy_k,
+                tiled_copy_v,
+                tile_m_idx,
+                mQ.shape[1],
+                mK.shape[1],
+                n_block_min,
+                n_block_max,
+                q_pipeline,
+                k_pipeline,
+                v_pipeline,
+            )
+        if is_consumer:
+            acc_o, lse = self.compute(
+                sQ,
+                sK,
+                sV,
+                tiled_mma_qk,
+                tiled_mma_pv,
+                tiled_copy_q_s2r,
+                tiled_copy_k_s2r,
+                tiled_copy_v_s2r,
+                tile_m_idx,
+                mQ.shape[1],
+                mK.shape[1],
+                softmax_scale_log2,
+                n_block_min,
+                n_block_max,
+                q_pipeline,
+                k_pipeline,
+                v_pipeline,
+            )
+            self.epilogue(
+                acc_o,
+                lse,
+                tiled_mma_pv,
+                gO,
+                gLSE,
+                tile_m_idx,
+                mQ.shape[1],
+            )
 
         assert cute.rank(sQ) == 2
         assert cute.rank(sK) == cute.rank(sV) == 3
