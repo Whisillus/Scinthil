@@ -124,3 +124,22 @@ def make_acc_tensor_mn_view(acc: cute.Tensor) -> cute.Tensor:
     )
     mn_layout = cute.make_layout(mn_shape, stride=mn_stride)
     return cute.make_tensor(acc.iterator, cute.composition(acc.layout, mn_layout))
+
+
+def transform_frg_P(acc: cute.Tensor) -> cute.Tensor:
+    assert acc.layout.shape[2] % 2 == 0
+
+    divided = cute.logical_divide(acc.layout, (None, None, 2))
+    frg_a_layout = cute.make_layout(
+        (
+            (divided.shape[0], divided.shape[2][0]),
+            divided.shape[1],
+            divided.shape[2][1],
+        ),
+        stride=(
+            (divided.stride[0], divided.stride[2][0]),
+            divided.stride[1],
+            divided.stride[2][1],
+        ),
+    )
+    return cute.make_tensor(acc.iterator, frg_a_layout)

@@ -15,6 +15,7 @@ class FlashAttentionForwardBase:
         stage_v: int = 1,
         is_causal: bool = False,
         acc_dtype=cutlass.Float32,
+        is_fastmath: bool = True,
     ) -> None:
         self.dtype = dtype
         self.dtype_byte = cutlass.const_expr(self.dtype.width // 8)
@@ -30,6 +31,7 @@ class FlashAttentionForwardBase:
         self.stage_k = stage_k
         self.stage_v = stage_v
         self.is_causal = is_causal
+        self.is_fastmath = is_fastmath
 
     def can_implement(self) -> bool:
         raise NotImplementedError

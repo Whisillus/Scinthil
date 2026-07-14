@@ -6,7 +6,7 @@ from cutlass.cute.nvgpu import cpasync
 
 from .block import BlockInfo
 from .fa_fwd_base import FlashAttentionForwardBase
-from .fa_utils import get_log2, get_predicate_load_v_seqlen
+from .fa_utils import get_log2, get_predicate_load_v_seqlen, transform_frg_P
 from .mask import FlashAttentionMaskSM120
 from .softmax import FlashAttentionSoftmaxSM120
 from .tile_scheduler import SingleTileScheduler
@@ -305,14 +305,19 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         self,
         qk_thr_mma: cute.ThrMma,
         tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
         tiled_copy_q_s2r: cute.TiledCopy,
         tiled_copy_k_s2r: cute.TiledCopy,
+        tiled_copy_v_s2r: cute.TiledCopy,
         tQsQ: cute.Tensor,
         tQrQ: cute.Tensor,
         tKsK: cute.Tensor,
         tKrK: cute.Tensor,
+        tVsVt: cute.Tensor,
+        tVrV: cute.Tensor,
         tCrQ: cute.Tensor,
         tCrK: cute.Tensor,
+        tCrV: cute.Tensor,
         acc_o: cute.Tensor,
         softmax: FlashAttentionSoftmaxSM120,
         score_mask: FlashAttentionMaskSM120,
@@ -370,7 +375,26 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         if cutlass.const_expr(not is_first_n_block):
             softmax.rescale_O(acc_o, row_scale)
 
+        rP = cute.make_fragment_like(acc_s, self.dtype)
+        rP.store(acc_s.load().to(self.dtype))
+        tCrP = transform_frg_P(rP)
+
+        assert cute.size(tCrP.shape[2]) == cute.size(tVsVt.shape[2])
+
         v_pipeline.consumer_wait(v_consumer_state)
+        for pv_block in cutlass.range_constexpr(cute.size(tCrP.shape[2])):
+            cute.copy(
+                tiled_copy_v_s2r,
+                tVsVt[None, None, pv_block, v_consumer_state.index],
+                tVrV[None, None, 0],
+            )
+            cute.gemm(
+                tiled_mma_pv,
+                acc_o,
+                tCrP[None, None, pv_block],
+                tCrV[None, None, 0],
+                acc_o,
+            )
         v_pipeline.consumer_release(v_consumer_state)
         v_consumer_state.advance()
 
@@ -381,10 +405,12 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         self,
         sQ: cute.Tensor,
         sK: cute.Tensor,
+        sV: cute.Tensor,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         tiled_copy_q_s2r: cute.TiledCopy,
         tiled_copy_k_s2r: cute.TiledCopy,
+        tiled_copy_v_s2r: cute.TiledCopy,
         tile_m_idx: cutlass.Int32,
         seqlen_q: cutlass.Int32,
         seqlen_k: cutlass.Int32,
@@ -416,12 +442,31 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
 
         assert cute.size(tQsQ.shape[2]) == cute.size(tKsK.shape[2])
 
+        sVt = cute.composition(
+            sV,
+            cute.make_ordered_layout(
+                (sV.shape[1], sV.shape[0], sV.shape[2]),
+                order=(1, 0, 2),
+            ),
+        )
+        sV_pv_block = cute.local_tile(sVt[None, None, 0], (self.headdim_v, self.mma_inst_k), (0, 0))
+        tCsV = pv_thr_mma.partition_B(sV_pv_block)
+        tCrV = pv_thr_mma.make_fragment_B(tCsV)
+
+        v_thr_copy = tiled_copy_v_s2r.get_slice(consumer_thread_idx)
+        tVsVt = v_thr_copy.partition_S(sVt)
+        tVrV = v_thr_copy.retile(tCrV)
+
         acc_shape_o = pv_thr_mma.partition_shape_C((self.tile_m, self.headdim_v))
         acc_o = cute.make_rmem_tensor(acc_shape_o, self.acc_dtype)
         acc_o.fill(0.0)
 
         num_rows = acc_o.shape[0][0] * acc_o.shape[1]
-        softmax = FlashAttentionSoftmaxSM120.create(softmax_scale_log2, num_rows)
+        softmax = FlashAttentionSoftmaxSM120.create(
+            softmax_scale_log2,
+            num_rows,
+            self.is_fastmath,
+        )
 
         score_mask = FlashAttentionMaskSM120.create(qk_thr_mma, self.tile_m, self.tile_n, self.is_causal)
 
@@ -434,14 +479,19 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         k_consumer_state, v_consumer_state = self.compute_step(
             qk_thr_mma,
             tiled_mma_qk,
+            tiled_mma_pv,
             tiled_copy_q_s2r,
             tiled_copy_k_s2r,
+            tiled_copy_v_s2r,
             tQsQ,
             tQrQ,
             tKsK,
             tKrK,
+            tVsVt,
+            tVrV,
             tCrQ,
             tCrK,
+            tCrV,
             acc_o,
             softmax,
             score_mask,
@@ -460,14 +510,19 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             k_consumer_state, v_consumer_state = self.compute_step(
                 qk_thr_mma,
                 tiled_mma_qk,
+                tiled_mma_pv,
                 tiled_copy_q_s2r,
                 tiled_copy_k_s2r,
+                tiled_copy_v_s2r,
                 tQsQ,
                 tQrQ,
                 tKsK,
                 tKrK,
+                tVsVt,
+                tVrV,
                 tCrQ,
                 tCrK,
+                tCrV,
                 acc_o,
                 softmax,
                 score_mask,
@@ -484,6 +539,8 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
 
         q_pipeline.consumer_release(q_consumer_state)
         q_consumer_state.advance()
+        final_scale = softmax.compute_final_scale()
+        softmax.rescale_O(acc_o, final_scale)
 
     @cute.jit
     def __call__(
@@ -537,6 +594,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
             self.tiled_mma_pv,
             self.tiled_copy_q_s2r,
             self.tiled_copy_k_s2r,
+            self.tiled_copy_v_s2r,
             SharedStorage,
         ).launch(
             grid=grid,
@@ -562,6 +620,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         tiled_mma_pv: cute.TiledMma,
         tiled_copy_q_s2r: cute.TiledCopy,
         tiled_copy_k_s2r: cute.TiledCopy,
+        tiled_copy_v_s2r: cute.TiledCopy,
         SharedStorage: cutlass.Constexpr,
     ) -> None:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -664,10 +723,12 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
                 self.compute(
                     sQ,
                     sK,
+                    sV,
                     tiled_mma_qk,
                     tiled_mma_pv,
                     tiled_copy_q_s2r,
                     tiled_copy_k_s2r,
+                    tiled_copy_v_s2r,
                     tile_m_idx,
                     mQ.shape[1],
                     mK.shape[1],

@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 
 import cutlass
@@ -34,16 +35,21 @@ def fadd_reduce(values: cute.TensorSSA, init_val: cutlass.Float32) -> cutlass.Fl
 @dataclass(frozen=True)
 class FlashAttentionSoftmaxSM120:
     softmax_scale_log2: cutlass.Float32
+    is_fastmath: bool
     row_max: cute.Tensor
     row_sum: cute.Tensor
 
     @staticmethod
-    def create(softmax_scale_log2: cutlass.Float32, num_rows: int) -> "FlashAttentionSoftmaxSM120":
+    def create(
+        softmax_scale_log2: cutlass.Float32,
+        num_rows: int,
+        is_fastmath: bool,
+    ) -> "FlashAttentionSoftmaxSM120":
         row_max = cute.make_rmem_tensor(num_rows, cutlass.Float32)
         row_sum = cute.make_rmem_tensor(num_rows, cutlass.Float32)
         row_max.fill(-cutlass.Float32.inf)
         row_sum.fill(0.0)
-        return FlashAttentionSoftmaxSM120(softmax_scale_log2, row_max, row_sum)
+        return FlashAttentionSoftmaxSM120(softmax_scale_log2, is_fastmath, row_max, row_sum)
 
     @cute.jit
     def online_softmax(
@@ -56,13 +62,13 @@ class FlashAttentionSoftmaxSM120:
         row_scale = cute.make_fragment_like(self.row_max, cutlass.Float32)
 
         for row in cutlass.range_constexpr(cute.size(self.row_max)):
-            scores = acc_s_mn[row, None].load()
+            acc_s_mn_row = acc_s_mn[row, None].load()
 
             if cutlass.const_expr(is_first):
-                curr_row_max = fmax_reduce(scores, -cutlass.Float32.inf)
+                curr_row_max = fmax_reduce(acc_s_mn_row, -cutlass.Float32.inf)
             else:
                 prev_row_max = self.row_max[row]
-                curr_row_max = fmax_reduce(scores, prev_row_max)
+                curr_row_max = fmax_reduce(acc_s_mn_row, prev_row_max)
             curr_row_max = cute.arch.warp_reduction_max(
                 curr_row_max,
                 threads_in_group=4,
@@ -71,26 +77,27 @@ class FlashAttentionSoftmaxSM120:
             self.row_max[row] = curr_row_max
             if cutlass.const_expr(check_inf):
                 curr_row_max = 0.0 if curr_row_max == -cutlass.Float32.inf else curr_row_max
-            probabilities = cute.math.exp2(
-                scores * self.softmax_scale_log2 - curr_row_max * self.softmax_scale_log2,
-                fastmath=True,
+
+            acc_s_mn_row_exp = cute.math.exp2(
+                acc_s_mn_row * self.softmax_scale_log2 - curr_row_max * self.softmax_scale_log2,
+                fastmath=self.is_fastmath,
             )
+
             if cutlass.const_expr(is_first):
-                correction = 1.0
-                curr_row_sum = fadd_reduce(probabilities, cutlass.Float32.zero)
+                row_scale[row] = 1.0
+                curr_row_sum = fadd_reduce(acc_s_mn_row_exp, cutlass.Float32.zero)
             else:
-                correction = cute.math.exp2(
+                row_scale[row] = cute.math.exp2(
                     (prev_row_max - curr_row_max) * self.softmax_scale_log2,
-                    fastmath=True,
+                    fastmath=self.is_fastmath,
                 )
                 curr_row_sum = fadd_reduce(
-                    probabilities,
-                    self.row_sum[row] * correction,
+                    acc_s_mn_row_exp,
+                    self.row_sum[row] * row_scale[row],
                 )
 
-            row_scale[row] = correction
             self.row_sum[row] = curr_row_sum
-            acc_s_mn[row, None].store(probabilities)
+            acc_s_mn[row, None].store(acc_s_mn_row_exp)
 
         return row_scale
 
@@ -103,11 +110,25 @@ class FlashAttentionSoftmaxSM120:
             acc_o_mn[row, None].store(acc_o_mn[row, None].load() * row_scale[row])
 
     @cute.jit
-    def normalize_output(self, acc_o: cute.Tensor) -> None:
-        acc_o_mn = make_acc_tensor_mn_view(acc_o)
+    def compute_final_scale(self) -> cute.Tensor:
+        row_sum = self.row_sum
+        lse = row_sum
 
-        for row in cutlass.range_constexpr(cute.size(self.row_sum)):
-            total = cute.arch.warp_reduction_sum(self.row_sum[row], threads_in_group=4)
-            invalid_total = total == 0.0 or total != total
-            inverse_total = 1.0 if invalid_total else cute.arch.rcp_approx(total)
-            acc_o_mn[row, None].store(acc_o_mn[row, None].load() * inverse_total)
+        for row in cutlass.range_constexpr(cute.size(row_sum)):
+            row_sum[row] = cute.arch.warp_reduction_sum(row_sum[row], threads_in_group=4)
+
+        final_scale = cute.make_fragment_like(self.row_max, cutlass.Float32)
+
+        for row in cutlass.range_constexpr(cute.size(row_sum)):
+            curr_row_sum = row_sum[row]
+            invalid_total = curr_row_sum == 0.0 or curr_row_sum != curr_row_sum
+            final_scale[row] = 1.0 if invalid_total else cute.arch.rcp_approx(curr_row_sum)
+
+            lse[row] = (
+                (self.row_max[row] * self.softmax_scale_log2 + cute.math.log2(curr_row_sum, fastmath=self.is_fastmath))
+                * math.log(2.0)
+                if not invalid_total
+                else -cutlass.Float32.inf
+            )
+
+        return final_scale
