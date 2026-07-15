@@ -4,10 +4,14 @@ import cutlass.cute as cute
 
 from .fa_fwd_ws_sm120 import FlashAttentionForwardM16N8K16SM120
 
-_TILE_M = 64
-_TILE_N = 16
-_STAGE_K = 1
-_STAGE_V = 1
+
+def get_fa_tile_stage(headdim_qk: int, headdim_v: int) -> tuple[int, int, int, int]:
+    """Select CTA tile sizes and K/V pipeline stages."""
+    tile_m = 64
+    tile_n = 16
+    stage_k = 1
+    stage_v = 1
+    return tile_m, tile_n, stage_k, stage_v
 
 
 @cute.jit
@@ -41,16 +45,17 @@ def flash_attention_bshd_sm120(
     assert mK.element_type == mV.element_type == mO.element_type == dtype
     assert mLSE.element_type == cutlass.Float32
 
+    tile_m, tile_n, stage_k, stage_v = get_fa_tile_stage(headdim_qk, headdim_v)
     fa_fwd = FlashAttentionForwardM16N8K16SM120(
         dtype=dtype,
         head_q=head_q,
         head_kv=head_kv,
         headdim_qk=headdim_qk,
         headdim_v=headdim_v,
-        tile_m=_TILE_M,
-        tile_n=_TILE_N,
-        stage_k=_STAGE_K,
-        stage_v=_STAGE_V,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        stage_k=stage_k,
+        stage_v=stage_v,
         is_causal=is_causal,
     )
     assert fa_fwd.can_implement(), "FlashAttention configuration cannot be implemented by the SM120 kernel"
