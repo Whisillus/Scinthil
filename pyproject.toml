@@ -16,6 +16,7 @@ dependencies = [
 dev = [
   "mypy",
   "pre-commit",
+  "pytest>=8.2,<10",
   "ruff",
 ]
 
@@ -53,3 +54,12 @@ no_implicit_optional = true
 [[tool.mypy.overrides]]
 module = ["cuda", "cuda.*", "cutlass", "cutlass.*", "tvm_ffi", "tvm_ffi.*"]
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+addopts = ["--strict-config", "--strict-markers"]
+markers = [
+  "compile_only: compiles CuTe DSL without executing kernels",
+  "gpu: requires a runnable CUDA GPU",
+  "sm120: targets SM120",
+]

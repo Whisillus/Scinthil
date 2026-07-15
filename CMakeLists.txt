@@ -21,5 +21,5 @@ if(SCINTHIL_BUILD_PROFILES)
 endif()
 
 if(SCINTHIL_BUILD_TESTS)
-  add_subdirectory(test)
+  add_subdirectory(tests)
 endif()
