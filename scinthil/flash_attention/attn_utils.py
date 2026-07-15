@@ -128,4 +128,55 @@ def get_input_KV(
     return mK, mV, max_seqlen_kv, None, None
 
 
-__all__ = ["CudaTensor", "check_cuda_runtime", "get_input_KV", "get_input_Q"]
+def get_output_O(
+    *,
+    o_layout: cute.Layout | cute.ComposedLayout,
+    dtype: type[Any],
+) -> CudaTensor:
+    """Allocate O using a caller-provided layout."""
+    if dtype not in (cutlass.Float16, cutlass.BFloat16):
+        raise TypeError("FlashAttention output must use FP16 or BF16")
+    if cute.rank(o_layout) != 4:
+        raise ValueError("o_layout must describe a rank-4 BSHD tensor")
+
+    o_num_bytes = int(cute.cosize(o_layout)) * dtype.width // 8
+    if o_num_bytes <= 0:
+        raise ValueError("o_layout must describe non-empty storage")
+
+    o_address = check_cuda_runtime(cuda_runtime.cudaMalloc(o_num_bytes))
+    o_ptr = cute.runtime.make_ptr(
+        dtype,
+        o_address,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    return CudaTensor(o_ptr, o_layout, o_address)
+
+
+def get_output_LSE(*, lse_layout: cute.Layout | cute.ComposedLayout) -> CudaTensor:
+    """Allocate FP32 LSE using a caller-provided layout."""
+    if cute.rank(lse_layout) != 3:
+        raise ValueError("lse_layout must describe a rank-3 BHS tensor")
+
+    lse_num_bytes = int(cute.cosize(lse_layout)) * cutlass.Float32.width // 8
+    if lse_num_bytes <= 0:
+        raise ValueError("lse_layout must describe non-empty storage")
+
+    lse_address = check_cuda_runtime(cuda_runtime.cudaMalloc(lse_num_bytes))
+    lse_ptr = cute.runtime.make_ptr(
+        cutlass.Float32,
+        lse_address,
+        cute.AddressSpace.gmem,
+        assumed_align=16,
+    )
+    return CudaTensor(lse_ptr, lse_layout, lse_address)
+
+
+__all__ = [
+    "CudaTensor",
+    "check_cuda_runtime",
+    "get_input_KV",
+    "get_input_Q",
+    "get_output_LSE",
+    "get_output_O",
+]
