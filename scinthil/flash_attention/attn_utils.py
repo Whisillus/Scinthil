@@ -4,76 +4,21 @@ import cuda.bindings.runtime as cuda_runtime
 import cutlass
 import cutlass.cute as cute
 
-
-def check_cuda_runtime(result: tuple[Any, ...]) -> Any:
-    error, *values = result
-    if error != cuda_runtime.cudaError_t.cudaSuccess:
-        raise RuntimeError(f"CUDA Runtime call failed with {error}")
-    if not values:
-        return None
-    if len(values) == 1:
-        return values[0]
-    return tuple(values)
-
-
-class CudaTensor:
-    """Own a cudaMalloc allocation and its CuTe layout."""
-
-    def __init__(
-        self,
-        ptr: cute.Pointer,
-        layout: cute.Layout | cute.ComposedLayout,
-        address: int | None,
-    ) -> None:
-        self.ptr = ptr
-        self.layout = layout
-        self._address = address
-        self._freed = False
-
-    def to_tensor(self, *, loc: Any = None, ip: Any = None) -> cute.Tensor:
-        return cute.make_tensor(self.ptr, self.layout, loc=loc, ip=ip)
-
-    def free(self) -> None:
-        if self._freed:
-            return
-        if self._address is None:
-            raise RuntimeError("Only the host allocation owner can free a CUDA tensor")
-        check_cuda_runtime(cuda_runtime.cudaFree(self._address))
-        self._freed = True
-
-    def __c_pointers__(self) -> Any:
-        if self._freed:
-            raise RuntimeError("Cannot use a freed CUDA tensor")
-        return self.ptr.__c_pointers__()
-
-    def __get_mlir_types__(self) -> Any:
-        return self.ptr.__get_mlir_types__()
-
-    def __extract_mlir_values__(self) -> Any:
-        return self.ptr.__extract_mlir_values__()
-
-    def __new_from_mlir_values__(self, values: Any) -> "CudaTensor":
-        return CudaTensor(
-            self.ptr.__new_from_mlir_values__(values),
-            self.layout,
-            address=None,
-        )
+from ..utils import CudaTensor, TensorLayout, check_cuda_runtime
 
 
 def get_input_Q(
     *,
-    q_layout: cute.Layout | cute.ComposedLayout,
+    q_layout: TensorLayout,
     dtype: type[Any],
 ) -> tuple[CudaTensor, int, None, None]:
     """Allocate BSHD Q and return fixed-length sequence metadata."""
     if dtype not in (cutlass.Float16, cutlass.BFloat16):
         raise TypeError("FlashAttention inputs must use FP16 or BF16")
-    if cute.rank(q_layout) != 4:
+    if q_layout.rank != 4:
         raise ValueError("q_layout must describe a rank-4 BSHD tensor")
 
-    num_bytes = int(cute.cosize(q_layout)) * dtype.width // 8
-    if num_bytes <= 0:
-        raise ValueError("q_layout must describe non-empty storage")
+    num_bytes = q_layout.cosize * dtype.width // 8
     address = check_cuda_runtime(cuda_runtime.cudaMalloc(num_bytes))
     ptr = cute.runtime.make_ptr(
         dtype,
@@ -83,29 +28,27 @@ def get_input_Q(
     )
 
     mQ = CudaTensor(ptr, q_layout, address)
-    max_seqlen_q = int(cute.size(q_layout, mode=[1]))
+    max_seqlen_q = q_layout.shape[1]
     return mQ, max_seqlen_q, None, None
 
 
 def get_input_KV(
     *,
-    k_layout: cute.Layout | cute.ComposedLayout,
-    v_layout: cute.Layout | cute.ComposedLayout,
+    k_layout: TensorLayout,
+    v_layout: TensorLayout,
     dtype: type[Any],
 ) -> tuple[CudaTensor, CudaTensor, int, None, None]:
     """Allocate BSHD K/V and return their shared sequence metadata."""
     if dtype not in (cutlass.Float16, cutlass.BFloat16):
         raise TypeError("FlashAttention inputs must use FP16 or BF16")
-    if cute.rank(k_layout) != 4 or cute.rank(v_layout) != 4:
+    if k_layout.rank != 4 or v_layout.rank != 4:
         raise ValueError("k_layout and v_layout must describe rank-4 BSHD tensors")
     for mode in (0, 1, 2):
-        if cute.size(k_layout, mode=[mode]) != cute.size(v_layout, mode=[mode]):
+        if k_layout.shape[mode] != v_layout.shape[mode]:
             raise ValueError("K and V layouts must have matching batch, sequence, and head extents")
 
-    k_num_bytes = int(cute.cosize(k_layout)) * dtype.width // 8
-    v_num_bytes = int(cute.cosize(v_layout)) * dtype.width // 8
-    if k_num_bytes <= 0 or v_num_bytes <= 0:
-        raise ValueError("K/V layouts must describe non-empty storage")
+    k_num_bytes = k_layout.cosize * dtype.width // 8
+    v_num_bytes = v_layout.cosize * dtype.width // 8
 
     k_address = check_cuda_runtime(cuda_runtime.cudaMalloc(k_num_bytes))
     v_address = check_cuda_runtime(cuda_runtime.cudaMalloc(v_num_bytes))
@@ -124,24 +67,22 @@ def get_input_KV(
 
     mK = CudaTensor(k_ptr, k_layout, k_address)
     mV = CudaTensor(v_ptr, v_layout, v_address)
-    max_seqlen_kv = int(cute.size(k_layout, mode=[1]))
+    max_seqlen_kv = k_layout.shape[1]
     return mK, mV, max_seqlen_kv, None, None
 
 
 def get_output_O(
     *,
-    o_layout: cute.Layout | cute.ComposedLayout,
+    o_layout: TensorLayout,
     dtype: type[Any],
 ) -> CudaTensor:
     """Allocate O using a caller-provided layout."""
     if dtype not in (cutlass.Float16, cutlass.BFloat16):
         raise TypeError("FlashAttention output must use FP16 or BF16")
-    if cute.rank(o_layout) != 4:
+    if o_layout.rank != 4:
         raise ValueError("o_layout must describe a rank-4 BSHD tensor")
 
-    o_num_bytes = int(cute.cosize(o_layout)) * dtype.width // 8
-    if o_num_bytes <= 0:
-        raise ValueError("o_layout must describe non-empty storage")
+    o_num_bytes = o_layout.cosize * dtype.width // 8
 
     o_address = check_cuda_runtime(cuda_runtime.cudaMalloc(o_num_bytes))
     o_ptr = cute.runtime.make_ptr(
@@ -153,14 +94,12 @@ def get_output_O(
     return CudaTensor(o_ptr, o_layout, o_address)
 
 
-def get_output_LSE(*, lse_layout: cute.Layout | cute.ComposedLayout) -> CudaTensor:
+def get_output_LSE(*, lse_layout: TensorLayout) -> CudaTensor:
     """Allocate FP32 LSE using a caller-provided layout."""
-    if cute.rank(lse_layout) != 3:
+    if lse_layout.rank != 3:
         raise ValueError("lse_layout must describe a rank-3 BHS tensor")
 
-    lse_num_bytes = int(cute.cosize(lse_layout)) * cutlass.Float32.width // 8
-    if lse_num_bytes <= 0:
-        raise ValueError("lse_layout must describe non-empty storage")
+    lse_num_bytes = lse_layout.cosize * cutlass.Float32.width // 8
 
     lse_address = check_cuda_runtime(cuda_runtime.cudaMalloc(lse_num_bytes))
     lse_ptr = cute.runtime.make_ptr(
@@ -173,8 +112,6 @@ def get_output_LSE(*, lse_layout: cute.Layout | cute.ComposedLayout) -> CudaTens
 
 
 __all__ = [
-    "CudaTensor",
-    "check_cuda_runtime",
     "get_input_KV",
     "get_input_Q",
     "get_output_LSE",
