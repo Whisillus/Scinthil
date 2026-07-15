@@ -8,24 +8,24 @@ repos:
       - id: check-toml
         files: ^pyproject\.toml$
       - id: end-of-file-fixer
-        files: ^(CMakeLists\.txt|pyproject\.toml|\.pre-commit-config\.yaml|scinthil/.*\.py|(csrc|profile|test)/(.*/)?CMakeLists\.txt|(csrc|scinthil)/cmake/.*\.cmake|(csrc|profile|test)/.*\.(cu|cuh|h|hpp|cc|cpp))$
+        files: ^(CMakeLists\.txt|pyproject\.toml|\.pre-commit-config\.yaml|(scinthil|profile/python|tests/python)/.*\.py|(csrc|profile|tests)/(.*/)?CMakeLists\.txt|(csrc|scinthil)/cmake/.*\.cmake|(csrc|profile|tests)/.*\.(cu|cuh|h|hpp|cc|cpp))$
       - id: trailing-whitespace
-        files: ^(CMakeLists\.txt|pyproject\.toml|\.pre-commit-config\.yaml|scinthil/.*\.py|(csrc|profile|test)/(.*/)?CMakeLists\.txt|(csrc|scinthil)/cmake/.*\.cmake|(csrc|profile|test)/.*\.(cu|cuh|h|hpp|cc|cpp))$
+        files: ^(CMakeLists\.txt|pyproject\.toml|\.pre-commit-config\.yaml|(scinthil|profile/python|tests/python)/.*\.py|(csrc|profile|tests)/(.*/)?CMakeLists\.txt|(csrc|scinthil)/cmake/.*\.cmake|(csrc|profile|tests)/.*\.(cu|cuh|h|hpp|cc|cpp))$
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
     rev: v22.1.0
     hooks:
       - id: clang-format
-        files: ^(csrc|profile|test)/.*\.(cu|cuh|h|hpp|cc|cpp)$
+        files: ^(csrc|profile|tests)/.*\.(cu|cuh|h|hpp|cc|cpp)$
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.8.6
     hooks:
       - id: ruff
         args: [--fix]
-        files: ^scinthil/.*\.py$
+        files: ^(scinthil|profile/python|tests/python)/.*\.py$
       - id: ruff-format
-        files: ^scinthil/.*\.py$
+        files: ^(scinthil|profile/python|tests/python)/.*\.py$
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.14.1

@@ -1,8 +1,29 @@
+import shutil
+import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import cuda.bindings.runtime as cuda_runtime
 import cutlass.cute as cute
+
+
+def generate_sass(cubin_path: Path, sass_dump_dir: Path) -> Path:
+    cuobjdump = shutil.which("cuobjdump")
+    if cuobjdump is None:
+        raise RuntimeError("cuobjdump is required to generate SASS")
+    if not cubin_path.is_file():
+        raise FileNotFoundError(f"CUBIN does not exist: {cubin_path}")
+
+    sass_path = sass_dump_dir / f"{cubin_path.stem}.sass"
+    with sass_path.open("w", encoding="utf-8") as sass_file:
+        subprocess.run(
+            [cuobjdump, "--dump-sass", str(cubin_path)],
+            check=True,
+            stdout=sass_file,
+            timeout=120,
+        )
+    return sass_path
 
 
 def check_cuda_runtime(result: tuple[Any, ...]) -> Any:
@@ -85,4 +106,4 @@ class CudaTensor:
         )
 
 
-__all__ = ["CudaTensor", "TensorLayout", "check_cuda_runtime"]
+__all__ = ["CudaTensor", "TensorLayout", "check_cuda_runtime", "generate_sass"]

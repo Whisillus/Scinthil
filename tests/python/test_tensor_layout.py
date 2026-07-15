@@ -45,4 +45,4 @@ def test_tensor_layout_is_immutable() -> None:
     layout = TensorLayout((2, 3), (3, 1))
 
     with pytest.raises(FrozenInstanceError):
-        setattr(layout, "shape", (6,))
+        layout.shape = (6,)

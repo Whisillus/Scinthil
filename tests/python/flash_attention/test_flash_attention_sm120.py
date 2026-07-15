@@ -1,8 +1,8 @@
 import pytest
 import torch
+from flash_attention_ref import flash_attention_ref
 
 from scinthil.flash_attention.sm120 import flash_attention_bshd_torch_sm120
-from flash_attention_ref import flash_attention_ref
 
 pytestmark = [pytest.mark.gpu, pytest.mark.sm120]
 
