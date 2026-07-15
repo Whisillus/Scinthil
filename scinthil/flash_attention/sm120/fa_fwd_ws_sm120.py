@@ -1,3 +1,4 @@
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
@@ -590,6 +591,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         softmax_scale: cutlass.Float32,
+        stream: cuda.CUstream,
     ) -> None:
         self.get_warpspecialize_config()
         self.get_smem_layout()
@@ -638,6 +640,7 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
+            stream=stream,
         )
 
     @cute.kernel
@@ -835,4 +838,5 @@ def check_compile(fa_fwd: FlashAttentionForwardM16N8K16SM120):
         mO,
         mLSE,
         cutlass.Float32(1.0),
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
     )
