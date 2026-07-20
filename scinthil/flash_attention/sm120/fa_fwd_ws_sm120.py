@@ -233,6 +233,10 @@ class FlashAttentionForwardM16N8K16SM120(FlashAttentionForwardBase):
     ) -> None:
         producer_thread_idx = cute.arch.thread_idx()[0] - self.num_consumer * cute.arch.WARP_SIZE
 
+        gQ = cute.make_tensor(gQ.iterator.align(16), gQ.layout)
+        gK = cute.make_tensor(gK.iterator.align(16), gK.layout)
+        gV = cute.make_tensor(gV.iterator.align(16), gV.layout)
+
         q_thr_copy = tiled_copy_q.get_slice(producer_thread_idx)
         tQgQ = q_thr_copy.partition_S(gQ)
         tQsQ = q_thr_copy.partition_D(sQ)
