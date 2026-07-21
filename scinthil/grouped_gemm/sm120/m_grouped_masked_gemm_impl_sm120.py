@@ -6,6 +6,7 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync
 
 from .group_gemm_base import GroupedGEMMBase
+from .grouped_gemm_utils import make_acc_tensor_mn_view
 from .scheduler import PersistentTileScheduler
 
 
@@ -41,6 +42,26 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         self.consumer_threads = self.num_consumer_warps * cute.arch.WARP_SIZE
         self.producer_threads = self.num_producer_warps * cute.arch.WARP_SIZE
         self.threads_per_cta = self.consumer_threads + self.producer_threads
+
+    def get_mma_atom(self) -> None:
+        self.mma_atom = cute.make_mma_atom(
+            cute.nvgpu.warp.MmaF16BF16Op(
+                self.dtype,
+                self.acc_dtype,
+                self.mma_inst_shape_mnk,
+            )
+        )
+
+    def get_tiled_mma(self) -> None:
+        atom_layout_mnk = cute.make_layout(
+            (self.num_consumer_warps, 1, 1),
+            stride=(1, self.num_consumer_warps, self.num_consumer_warps),
+        )
+        self.tiled_mma = cute.make_tiled_mma(
+            self.mma_atom,
+            atom_layout_mnk,
+            permutation_mnk=self.mma_warp_tile_shape_mnk,
+        )
 
     def get_smem_layout_atom(self) -> None:
         layout_atom_outer = cute.make_layout(
@@ -111,6 +132,27 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         self.tiled_copy_a = cute.make_tiled_copy_tv(self.load_a_atom, a_thread_layout, value_layout)
         self.tiled_copy_b = cute.make_tiled_copy_tv(self.load_b_atom, b_thread_layout, value_layout)
 
+    def get_ab_s2r_atom(self) -> None:
+        self.s2r_a_atom = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(
+                transpose=False,
+                num_matrices=4,
+            ),
+            self.dtype,
+        )
+        self.s2r_b_atom = cute.make_copy_atom(
+            cute.nvgpu.warp.LdMatrix8x8x16bOp(
+                transpose=False,
+                num_matrices=4,
+            ),
+            self.dtype,
+        )
+
+    def get_ab_s2r(self) -> None:
+        self.get_ab_s2r_atom()
+        self.tiled_copy_a_s2r = cute.make_tiled_copy_A(self.s2r_a_atom, self.tiled_mma)
+        self.tiled_copy_b_s2r = cute.make_tiled_copy_B(self.s2r_b_atom, self.tiled_mma)
+
     def __call__(
         self,
         mA: cute.Tensor,
@@ -120,8 +162,11 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         stream: cuda.CUstream,
     ) -> None:
         self.get_warpspecialize_config()
+        self.get_mma_atom()
+        self.get_tiled_mma()
         self.get_smem_layout()
         self.get_ab_load()
+        self.get_ab_s2r()
 
         @cute.struct
         class SharedStorage:
@@ -133,7 +178,8 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
                 cute.struct.MemRange[self.dtype, self.sB_size],
                 128,
             ]
-            ab_mbar: cute.struct.MemRange[cutlass.Int64, self.stages * 2]
+            a_mbar: cute.struct.MemRange[cutlass.Int64, self.stages * 2]
+            b_mbar: cute.struct.MemRange[cutlass.Int64, self.stages * 2]
 
         groups, max_m, _ = mA.shape
         _, n, _ = mB.shape
@@ -154,6 +200,9 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
             self.sB_layout,
             self.tiled_copy_a,
             self.tiled_copy_b,
+            self.tiled_mma,
+            self.tiled_copy_a_s2r,
+            self.tiled_copy_b_s2r,
             SharedStorage,
         ).launch(
             grid=grid,
@@ -176,9 +225,11 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         valid_m: cutlass.Int32,
         n: cutlass.Int32,
         k_tile_count: cutlass.Int32,
-        ab_pipeline: pipeline.PipelineCpAsync,
-        producer_state: pipeline.PipelineState,
-    ) -> pipeline.PipelineState:
+        a_pipeline: pipeline.PipelineCpAsync,
+        b_pipeline: pipeline.PipelineCpAsync,
+        a_producer_state: pipeline.PipelineState,
+        b_producer_state: pipeline.PipelineState,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
         producer_thread_idx = cute.arch.thread_idx()[0] - self.consumer_threads
         local_m = producer_thread_idx // self.a_vectors_per_row
         local_n = producer_thread_idx // self.b_vectors_per_row
@@ -231,40 +282,93 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         tBpB.fill(n_idx < n)
 
         for k_tile_idx in cutlass.range(k_tile_count):
-            ab_pipeline.producer_acquire(producer_state)
+            a_pipeline.producer_acquire(a_producer_state)
             cute.copy(
                 tiled_copy_a,
                 tAgA[None, None, None, k_tile_idx],
-                tAsA[None, None, None, producer_state.index],
+                tAsA[None, None, None, a_producer_state.index],
                 pred=tApA,
             )
+            a_pipeline.producer_commit(a_producer_state)
+            a_producer_state.advance()
+
+            b_pipeline.producer_acquire(b_producer_state)
             cute.copy(
                 tiled_copy_b,
                 tBgB[None, None, None, k_tile_idx],
-                tBsB[None, None, None, producer_state.index],
+                tBsB[None, None, None, b_producer_state.index],
                 pred=tBpB,
             )
-            ab_pipeline.producer_commit(producer_state)
-            producer_state.advance()
+            b_pipeline.producer_commit(b_producer_state)
+            b_producer_state.advance()
 
-        return producer_state
+        return a_producer_state, b_producer_state
 
     @cute.jit
     def compute(
         self,
+        sA: cute.Tensor,
+        sB: cute.Tensor,
+        tiled_mma: cute.TiledMma,
+        tiled_copy_a_s2r: cute.TiledCopy,
+        tiled_copy_b_s2r: cute.TiledCopy,
         k_tile_count: cutlass.Int32,
-        ab_pipeline: pipeline.PipelineCpAsync,
-        consumer_state: pipeline.PipelineState,
-    ) -> pipeline.PipelineState:
+        a_pipeline: pipeline.PipelineCpAsync,
+        b_pipeline: pipeline.PipelineCpAsync,
+        a_consumer_state: pipeline.PipelineState,
+        b_consumer_state: pipeline.PipelineState,
+    ) -> tuple[cute.Tensor, pipeline.PipelineState, pipeline.PipelineState]:
+        consumer_thread_idx = cute.arch.thread_idx()[0]
+        thr_mma = tiled_mma.get_slice(consumer_thread_idx)
+
+        tCsA = thr_mma.partition_A(sA)
+        tCsB = thr_mma.partition_B(sB)
+        tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
+        tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
+
+        a_thr_copy = tiled_copy_a_s2r.get_slice(consumer_thread_idx)
+        tAsA = a_thr_copy.partition_S(sA)
+        tArA = a_thr_copy.retile(tCrA)
+        b_thr_copy = tiled_copy_b_s2r.get_slice(consumer_thread_idx)
+        tBsB = b_thr_copy.partition_S(sB)
+        tBrB = b_thr_copy.retile(tCrB)
+
+        acc_shape = thr_mma.partition_shape_C((self.tile_m, self.tile_n))
+        accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+        accumulators.fill(0.0)
+
         for _ in cutlass.range(k_tile_count):
-            ab_pipeline.consumer_wait(consumer_state)
-            ab_pipeline.consumer_release(consumer_state)
-            consumer_state.advance()
-        return consumer_state
+            a_pipeline.consumer_wait(a_consumer_state)
+            cute.copy(
+                tiled_copy_a_s2r,
+                tAsA[None, None, 0, a_consumer_state.index],
+                tArA[None, None, 0],
+            )
+            a_pipeline.consumer_release(a_consumer_state)
+            a_consumer_state.advance()
+
+            b_pipeline.consumer_wait(b_consumer_state)
+            cute.copy(
+                tiled_copy_b_s2r,
+                tBsB[None, None, 0, b_consumer_state.index],
+                tBrB[None, None, 0],
+            )
+            b_pipeline.consumer_release(b_consumer_state)
+            b_consumer_state.advance()
+
+            cute.gemm(
+                tiled_mma,
+                accumulators,
+                tCrA[None, None, 0],
+                tCrB[None, None, 0],
+                accumulators,
+            )
+        return accumulators, a_consumer_state, b_consumer_state
 
     @cute.jit
     def epilogue(
         self,
+        accumulators: cute.Tensor,
         mD: cute.Tensor,
         valid_m: cutlass.Int32,
         n: cutlass.Int32,
@@ -272,21 +376,24 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         tile_n_idx: cutlass.Int32,
         group_idx: cutlass.Int32,
     ) -> None:
-        thread_idx = cute.arch.thread_idx()[0]
+        lane_idx = cute.arch.lane_idx()
         tile_m_offset = tile_m_idx * self.tile_m
         tile_n_offset = tile_n_idx * self.tile_n
 
-        for linear_idx in cutlass.range(
-            thread_idx,
-            self.tile_m * self.tile_n,
-            self.consumer_threads,
-        ):
-            local_m = linear_idx // self.tile_n
-            local_n = linear_idx % self.tile_n
-            m_idx = tile_m_offset + local_m
-            n_idx = tile_n_offset + local_n
-            if m_idx < valid_m and n_idx < n:
-                mD[group_idx, m_idx, n_idx] = self.dtype(0)
+        rD = cute.make_fragment_like(accumulators, self.dtype)
+        rD.store(accumulators.load().to(self.dtype))
+        rD_mn = make_acc_tensor_mn_view(rD)
+        assert cute.size(rD_mn, mode=[0]) == 2
+        assert cute.size(rD_mn, mode=[1]) == 4
+
+        lane_m = lane_idx // 4
+        lane_n = (lane_idx % 4) * 2
+        for row in cutlass.range_constexpr(cute.size(rD_mn, mode=[0])):
+            m_idx = tile_m_offset + lane_m + row * 8
+            for col in cutlass.range_constexpr(cute.size(rD_mn, mode=[1])):
+                n_idx = tile_n_offset + lane_n + col % 2 + (col // 2) * 8
+                if m_idx < valid_m and n_idx < n:
+                    mD[group_idx, m_idx, n_idx] = rD_mn[row, col]
 
     @cute.kernel
     def kernel(
@@ -299,6 +406,9 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         sB_layout: cute.ComposedLayout,
         tiled_copy_a: cute.TiledCopy,
         tiled_copy_b: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+        tiled_copy_a_s2r: cute.TiledCopy,
+        tiled_copy_b_s2r: cute.TiledCopy,
         SharedStorage: cutlass.Constexpr,
     ) -> None:
         groups, max_m, gemm_k = mA.shape
@@ -325,8 +435,15 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
             pipeline.Agent.Thread,
             self.consumer_threads,
         )
-        ab_pipeline = pipeline.PipelineCpAsync.create(
-            barrier_storage=storage.ab_mbar.data_ptr(),
+        a_pipeline = pipeline.PipelineCpAsync.create(
+            barrier_storage=storage.a_mbar.data_ptr(),
+            num_stages=self.stages,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            defer_sync=True,
+        )
+        b_pipeline = pipeline.PipelineCpAsync.create(
+            barrier_storage=storage.b_mbar.data_ptr(),
             num_stages=self.stages,
             producer_group=producer_group,
             consumer_group=consumer_group,
@@ -348,11 +465,19 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
             block_idx_x,
             grid_dim_x,
         )
-        producer_state = pipeline.make_pipeline_state(
+        a_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer,
             self.stages,
         )
-        consumer_state = pipeline.make_pipeline_state(
+        b_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer,
+            self.stages,
+        )
+        a_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer,
+            self.stages,
+        )
+        b_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer,
             self.stages,
         )
@@ -361,7 +486,7 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
             tile_m_idx, tile_n_idx, group_idx = work_tile.tile_idx
             valid_m = mInfo[group_idx]
             if is_producer:
-                producer_state = self.load(
+                a_producer_state, b_producer_state = self.load(
                     mA,
                     mB,
                     sA,
@@ -374,17 +499,27 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
                     valid_m,
                     n,
                     k_tile_count,
-                    ab_pipeline,
-                    producer_state,
+                    a_pipeline,
+                    b_pipeline,
+                    a_producer_state,
+                    b_producer_state,
                 )
             if is_consumer:
-                consumer_state = self.compute(
+                accumulators, a_consumer_state, b_consumer_state = self.compute(
+                    sA,
+                    sB,
+                    tiled_mma,
+                    tiled_copy_a_s2r,
+                    tiled_copy_b_s2r,
                     k_tile_count,
-                    ab_pipeline,
-                    consumer_state,
+                    a_pipeline,
+                    b_pipeline,
+                    a_consumer_state,
+                    b_consumer_state,
                 )
-                self.epilogue(mD, valid_m, n, tile_m_idx, tile_n_idx, group_idx)
+                self.epilogue(accumulators, mD, valid_m, n, tile_m_idx, tile_n_idx, group_idx)
             work_tile = scheduler.advance_to_next_work()
 
         if is_producer:
-            ab_pipeline.producer_tail(producer_state)
+            a_pipeline.producer_tail(a_producer_state)
+            b_pipeline.producer_tail(b_producer_state)
