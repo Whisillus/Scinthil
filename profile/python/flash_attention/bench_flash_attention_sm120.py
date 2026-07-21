@@ -3,9 +3,8 @@ import argparse
 import cutlass
 import torch
 
-from scinthil.flash_attention.attn_utils import get_fa_metrics
 from scinthil.flash_attention.sm120 import flash_attention_bshd_torch_sm120
-from scinthil.testing.benchmark import bench_cute_kernel
+from scinthil.testing import bench_cute_kernel, get_flash_attention_metrics, make_torch_tensor
 from scinthil.utils import TensorLayout
 
 
@@ -26,20 +25,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init", choices=("randn", "zero", "empty"), default="randn")
     parser.add_argument("--seed", type=int, default=0)
     return parser.parse_args()
-
-
-def make_input(
-    shape: tuple[int, ...],
-    *,
-    dtype: torch.dtype,
-    device: torch.device,
-    init: str,
-) -> torch.Tensor:
-    if init == "empty":
-        return torch.empty(shape, dtype=dtype, device=device)
-    if init == "zero":
-        return torch.zeros(shape, dtype=dtype, device=device)
-    return torch.randn(shape, dtype=dtype, device=device)
 
 
 def main() -> int:
@@ -68,28 +53,33 @@ def main() -> int:
         raise RuntimeError(f"SM120 CUDA device is required, got capability {capability}")
 
     dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
+    init_op = {
+        "empty": torch.empty,
+        "zero": torch.zeros,
+        "randn": torch.randn,
+    }[args.init]
     torch.manual_seed(args.seed)
 
     with torch.cuda.device(device):
-        q = make_input(
+        q = make_torch_tensor(
             (args.batch_size, args.seqlen_q, args.head_q, args.headdim_qk),
             dtype=dtype,
             device=device,
-            init=args.init,
+            init_op=init_op,
         )
-        k = make_input(
+        k = make_torch_tensor(
             (args.batch_size, args.seqlen_kv, args.head_kv, args.headdim_qk),
             dtype=dtype,
             device=device,
-            init=args.init,
+            init_op=init_op,
         )
-        v = make_input(
+        v = make_torch_tensor(
             (args.batch_size, args.seqlen_kv, args.head_kv, args.headdim_v),
             dtype=dtype,
             device=device,
-            init=args.init,
+            init_op=init_op,
         )
-        load_bytes, store_bytes, flops = get_fa_metrics(
+        load_bytes, store_bytes, flops = get_flash_attention_metrics(
             q_layout=TensorLayout(tuple(q.shape), tuple(q.stride())),
             k_layout=TensorLayout(tuple(k.shape), tuple(k.stride())),
             v_layout=TensorLayout(tuple(v.shape), tuple(v.stride())),

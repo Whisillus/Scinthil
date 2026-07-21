@@ -5,6 +5,16 @@ import cutlass.cute.testing as cute_testing
 import torch
 
 
+def make_torch_tensor(
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    init_op: Callable[..., torch.Tensor],
+) -> torch.Tensor:
+    return init_op(shape, dtype=dtype, device=device)
+
+
 def bench_cute_kernel(
     kernel: Callable[[], Any],
     *,
