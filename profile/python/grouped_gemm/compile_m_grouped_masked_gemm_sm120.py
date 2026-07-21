@@ -57,9 +57,9 @@ def main() -> int:
         mB,
         mD,
         mInfo,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         True,
         args.block_swizzle_factor,
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
     )
 
     print(

@@ -14,7 +14,9 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
     def __init__(
         self,
         *,
-        dtype,
+        dtype_a,
+        dtype_b,
+        dtype_d,
         tile_m: int,
         tile_n: int,
         tile_k: int,
@@ -22,7 +24,9 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         block_swizzle_factor: int = 8,
     ) -> None:
         super().__init__(
-            dtype=dtype,
+            dtype_a=dtype_a,
+            dtype_b=dtype_b,
+            dtype_d=dtype_d,
             tile_m=tile_m,
             tile_n=tile_n,
             tile_k=tile_k,
@@ -44,10 +48,11 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         self.threads_per_cta = self.consumer_threads + self.producer_threads
 
     def get_mma_atom(self) -> None:
+        assert self.dtype_a == self.dtype_b
         self.mma_atom = cute.make_mma_atom(
             cute.nvgpu.warp.MmaF16BF16Op(
-                self.dtype,
-                self.acc_dtype,
+                self.dtype_a,
+                self.dtype_acc,
                 self.mma_inst_shape_mnk,
             )
         )
@@ -94,21 +99,22 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         self.num_bits_per_copy = 128
         self.load_a_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            self.dtype,
+            self.dtype_a,
             num_bits_per_copy=self.num_bits_per_copy,
         )
         self.load_b_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            self.dtype,
+            self.dtype_b,
             num_bits_per_copy=self.num_bits_per_copy,
         )
 
     def get_ab_load(self) -> None:
         self.get_ab_load_atom()
 
-        copy_elems = self.num_bits_per_copy // self.dtype.width
-        self.a_vectors_per_row = self.sA_layout_atom.outer.shape[1] // copy_elems
-        self.b_vectors_per_row = self.sB_layout_atom.outer.shape[1] // copy_elems
+        a_copy_elems = self.num_bits_per_copy // self.dtype_a.width
+        b_copy_elems = self.num_bits_per_copy // self.dtype_b.width
+        self.a_vectors_per_row = self.sA_layout_atom.outer.shape[1] // a_copy_elems
+        self.b_vectors_per_row = self.sB_layout_atom.outer.shape[1] // b_copy_elems
         assert self.producer_threads % self.a_vectors_per_row == 0
         assert self.producer_threads % self.b_vectors_per_row == 0
 
@@ -125,12 +131,24 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
             (b_rows_per_copy, self.b_vectors_per_row),
             stride=(self.b_vectors_per_row, 1),
         )
-        value_layout = cute.make_layout(
-            (1, copy_elems),
-            stride=(copy_elems, 1),
+        a_value_layout = cute.make_layout(
+            (1, a_copy_elems),
+            stride=(a_copy_elems, 1),
         )
-        self.tiled_copy_a = cute.make_tiled_copy_tv(self.load_a_atom, a_thread_layout, value_layout)
-        self.tiled_copy_b = cute.make_tiled_copy_tv(self.load_b_atom, b_thread_layout, value_layout)
+        b_value_layout = cute.make_layout(
+            (1, b_copy_elems),
+            stride=(b_copy_elems, 1),
+        )
+        self.tiled_copy_a = cute.make_tiled_copy_tv(
+            self.load_a_atom,
+            a_thread_layout,
+            a_value_layout,
+        )
+        self.tiled_copy_b = cute.make_tiled_copy_tv(
+            self.load_b_atom,
+            b_thread_layout,
+            b_value_layout,
+        )
 
     def get_ab_s2r_atom(self) -> None:
         self.s2r_a_atom = cute.make_copy_atom(
@@ -138,14 +156,14 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
                 transpose=False,
                 num_matrices=4,
             ),
-            self.dtype,
+            self.dtype_a,
         )
         self.s2r_b_atom = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(
                 transpose=False,
                 num_matrices=4,
             ),
-            self.dtype,
+            self.dtype_b,
         )
 
     def get_ab_s2r(self) -> None:
@@ -171,11 +189,11 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         @cute.struct
         class SharedStorage:
             sA: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, self.sA_size],
+                cute.struct.MemRange[self.dtype_a, self.sA_size],
                 128,
             ]
             sB: cute.struct.Align[
-                cute.struct.MemRange[self.dtype, self.sB_size],
+                cute.struct.MemRange[self.dtype_b, self.sB_size],
                 128,
             ]
             a_mbar: cute.struct.MemRange[cutlass.Int64, self.stages * 2]
@@ -334,7 +352,7 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         tBrB = b_thr_copy.retile(tCrB)
 
         acc_shape = thr_mma.partition_shape_C((self.tile_m, self.tile_n))
-        accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
+        accumulators = cute.make_rmem_tensor(acc_shape, self.dtype_acc)
         accumulators.fill(0.0)
 
         for _ in cutlass.range(k_tile_count):
@@ -380,8 +398,8 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         tile_m_offset = tile_m_idx * self.tile_m
         tile_n_offset = tile_n_idx * self.tile_n
 
-        rD = cute.make_fragment_like(accumulators, self.dtype)
-        rD.store(accumulators.load().to(self.dtype))
+        rD = cute.make_fragment_like(accumulators, self.dtype_d)
+        rD.store(accumulators.load().to(self.dtype_d))
         rD_mn = make_acc_tensor_mn_view(rD)
         assert cute.size(rD_mn, mode=[0]) == 2
         assert cute.size(rD_mn, mode=[1]) == 4

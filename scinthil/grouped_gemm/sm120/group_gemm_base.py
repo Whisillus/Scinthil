@@ -7,19 +7,25 @@ class GroupedGEMMBase:
     def __init__(
         self,
         *,
-        dtype: type[Any],
+        dtype_a: type[Any],
+        dtype_b: type[Any],
+        dtype_d: type[Any],
         tile_m: int,
         tile_n: int,
         tile_k: int,
         use_block_swizzle: bool,
         block_swizzle_factor: int = 8,
         stages: int = 1,
-        acc_dtype: type[Any] = cutlass.Float32,
+        dtype_acc: type[Any] = cutlass.Float32,
         max_persistent_ctas: int = 170,
     ) -> None:
-        self.dtype = dtype
-        self.dtype_byte = cutlass.const_expr(self.dtype.width // 8)
-        self.acc_dtype = acc_dtype
+        self.dtype_a = dtype_a
+        self.dtype_b = dtype_b
+        self.dtype_d = dtype_d
+        self.dtype_byte_a = cutlass.const_expr(self.dtype_a.width // 8)
+        self.dtype_byte_b = cutlass.const_expr(self.dtype_b.width // 8)
+        self.dtype_byte_d = cutlass.const_expr(self.dtype_d.width // 8)
+        self.dtype_acc = dtype_acc
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.tile_k = tile_k
