@@ -14,7 +14,7 @@ class WorkTileInfo(utils.WorkTileInfo):
 
 
 class PersistentTileScheduler:
-    """Persistent masked-group scheduler without multicast or block swizzle."""
+    """Persistent masked-group scheduler with M-oriented L2 block swizzle."""
 
     @staticmethod
     def get_grid_shape(
@@ -29,6 +29,8 @@ class PersistentTileScheduler:
     def __init__(
         self,
         tile_m: int,
+        use_block_swizzle: bool,
+        num_1d_blocks_per_group: int,
         num_tile_m: cutlass.Int32,
         num_tile_n: cutlass.Int32,
         num_groups: cutlass.Int32,
@@ -43,6 +45,8 @@ class PersistentTileScheduler:
         ip=None,
     ) -> None:
         self.tile_m = tile_m
+        self.use_block_swizzle = use_block_swizzle
+        self.num_1d_blocks_per_group = num_1d_blocks_per_group
         self.num_tile_m = num_tile_m
         self.num_tile_n = num_tile_n
         self.num_groups = num_groups
@@ -59,6 +63,8 @@ class PersistentTileScheduler:
     @cute.jit
     def create(
         tile_m: int,
+        use_block_swizzle: cutlass.Constexpr,
+        num_1d_blocks_per_group: int,
         num_tile_m: cutlass.Int32,
         num_tile_n: cutlass.Int32,
         num_groups: cutlass.Int32,
@@ -72,6 +78,8 @@ class PersistentTileScheduler:
         initial_group_tile_end = cute.ceil_div(mInfo[0], tile_m) * num_tile_n
         return PersistentTileScheduler(
             tile_m,
+            use_block_swizzle,
+            num_1d_blocks_per_group,
             num_tile_m,
             num_tile_n,
             num_groups,
@@ -100,8 +108,20 @@ class PersistentTileScheduler:
         if is_valid_tile:
             current_num_tile_m = cute.ceil_div(self.mInfo[self.current_group_idx], self.tile_m)
             local_linear_idx = self.current_linear_idx - self.group_tile_start
-            tile_m_idx = local_linear_idx % current_num_tile_m
-            tile_n_idx = local_linear_idx // current_num_tile_m
+            if cutlass.const_expr(self.use_block_swizzle):
+                num_blocks_per_group = self.num_tile_n * self.num_1d_blocks_per_group
+                block_group_idx = local_linear_idx // num_blocks_per_group
+                first_m_block_idx = block_group_idx * self.num_1d_blocks_per_group
+                in_group_idx = local_linear_idx % num_blocks_per_group
+                num_blocks_in_group = cutlass.min(
+                    self.num_1d_blocks_per_group,
+                    current_num_tile_m - first_m_block_idx,
+                )
+                tile_m_idx = first_m_block_idx + in_group_idx % num_blocks_in_group
+                tile_n_idx = in_group_idx // num_blocks_in_group
+            else:
+                tile_m_idx = local_linear_idx % current_num_tile_m
+                tile_n_idx = local_linear_idx // current_num_tile_m
             group_idx = self.current_group_idx
         return WorkTileInfo((tile_m_idx, tile_n_idx, group_idx), is_valid_tile)
 
@@ -129,6 +149,8 @@ class PersistentTileScheduler:
         group_tile_end = cutlass.new_from_mlir_values(self.group_tile_end, values[3:])
         return PersistentTileScheduler(
             self.tile_m,
+            self.use_block_swizzle,
+            self.num_1d_blocks_per_group,
             self.num_tile_m,
             self.num_tile_n,
             self.num_groups,
