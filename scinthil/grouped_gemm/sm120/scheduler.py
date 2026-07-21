@@ -30,7 +30,7 @@ class PersistentTileScheduler:
         self,
         tile_m: int,
         use_block_swizzle: bool,
-        num_1d_blocks_per_group: int,
+        block_swizzle_factor: int,
         num_tile_m: cutlass.Int32,
         num_tile_n: cutlass.Int32,
         num_groups: cutlass.Int32,
@@ -46,7 +46,7 @@ class PersistentTileScheduler:
     ) -> None:
         self.tile_m = tile_m
         self.use_block_swizzle = use_block_swizzle
-        self.num_1d_blocks_per_group = num_1d_blocks_per_group
+        self.block_swizzle_factor = block_swizzle_factor
         self.num_tile_m = num_tile_m
         self.num_tile_n = num_tile_n
         self.num_groups = num_groups
@@ -64,7 +64,7 @@ class PersistentTileScheduler:
     def create(
         tile_m: int,
         use_block_swizzle: cutlass.Constexpr,
-        num_1d_blocks_per_group: int,
+        block_swizzle_factor: int,
         num_tile_m: cutlass.Int32,
         num_tile_n: cutlass.Int32,
         num_groups: cutlass.Int32,
@@ -75,11 +75,12 @@ class PersistentTileScheduler:
         loc=None,
         ip=None,
     ) -> "PersistentTileScheduler":
-        initial_group_tile_end = cute.ceil_div(mInfo[0], tile_m) * num_tile_n
+        initial_group_m = mInfo[0]
+        initial_group_tile_end = cute.ceil_div(initial_group_m, tile_m) * num_tile_n
         return PersistentTileScheduler(
             tile_m,
             use_block_swizzle,
-            num_1d_blocks_per_group,
+            block_swizzle_factor,
             num_tile_m,
             num_tile_n,
             num_groups,
@@ -99,22 +100,24 @@ class PersistentTileScheduler:
             self.current_group_idx += 1
             self.group_tile_start = self.group_tile_end
             if self.current_group_idx < self.num_groups:
-                self.group_tile_end += cute.ceil_div(self.mInfo[self.current_group_idx], self.tile_m) * self.num_tile_n
+                current_group_m = self.mInfo[self.current_group_idx]
+                self.group_tile_end += cute.ceil_div(current_group_m, self.tile_m) * self.num_tile_n
 
         tile_m_idx = cutlass.Int32(0)
         tile_n_idx = cutlass.Int32(0)
         group_idx = cutlass.Int32(0)
         is_valid_tile = self.current_group_idx < self.num_groups
         if is_valid_tile:
-            current_num_tile_m = cute.ceil_div(self.mInfo[self.current_group_idx], self.tile_m)
+            current_group_m = self.mInfo[self.current_group_idx]
+            current_num_tile_m = cute.ceil_div(current_group_m, self.tile_m)
             local_linear_idx = self.current_linear_idx - self.group_tile_start
             if cutlass.const_expr(self.use_block_swizzle):
-                num_blocks_per_group = self.num_tile_n * self.num_1d_blocks_per_group
+                num_blocks_per_group = self.num_tile_n * self.block_swizzle_factor
                 block_group_idx = local_linear_idx // num_blocks_per_group
-                first_m_block_idx = block_group_idx * self.num_1d_blocks_per_group
+                first_m_block_idx = block_group_idx * self.block_swizzle_factor
                 in_group_idx = local_linear_idx % num_blocks_per_group
                 num_blocks_in_group = cutlass.min(
-                    self.num_1d_blocks_per_group,
+                    self.block_swizzle_factor,
                     current_num_tile_m - first_m_block_idx,
                 )
                 tile_m_idx = first_m_block_idx + in_group_idx % num_blocks_in_group
@@ -150,7 +153,7 @@ class PersistentTileScheduler:
         return PersistentTileScheduler(
             self.tile_m,
             self.use_block_swizzle,
-            self.num_1d_blocks_per_group,
+            self.block_swizzle_factor,
             self.num_tile_m,
             self.num_tile_n,
             self.num_groups,
