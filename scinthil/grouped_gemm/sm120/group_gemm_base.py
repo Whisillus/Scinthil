@@ -46,10 +46,10 @@ class GroupedGEMMBase:
     def get_smem_layout(self) -> None:
         raise NotImplementedError
 
-    def get_ab_load_atom(self) -> None:
+    def get_g2s_load_atom(self) -> None:
         raise NotImplementedError
 
-    def get_ab_load(self) -> None:
+    def get_g2s_load(self) -> None:
         raise NotImplementedError
 
     def get_ab_s2r_atom(self) -> None:

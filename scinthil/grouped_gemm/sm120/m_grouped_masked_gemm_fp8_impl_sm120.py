@@ -3,6 +3,8 @@ from typing import Any
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+import cutlass.pipeline as pipeline
+import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync
 
 from .group_gemm_base import GroupedGEMMBase
@@ -120,7 +122,7 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
         self.sScaleA_size = cute.cosize(self.sScaleA_layout)
         self.sScaleB_size = cute.cosize(self.sScaleB_layout)
 
-    def get_ab_load_atom(self) -> None:
+    def get_g2s_load_atom(self) -> None:
         self.num_bits_per_copy = 128
         self.load_a_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -132,9 +134,20 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
             self.dtype_b,
             num_bits_per_copy=self.num_bits_per_copy,
         )
+        self.scale_num_bits_per_copy = 32
+        self.load_scale_a_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+            self.scale_dtype,
+            num_bits_per_copy=self.scale_num_bits_per_copy,
+        )
+        self.load_scale_b_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
+            self.scale_dtype,
+            num_bits_per_copy=self.scale_num_bits_per_copy,
+        )
 
-    def get_ab_load(self) -> None:
-        self.get_ab_load_atom()
+    def get_g2s_load(self) -> None:
+        self.get_g2s_load_atom()
 
         a_copy_elems = self.num_bits_per_copy // self.dtype_a.width
         b_copy_elems = self.num_bits_per_copy // self.dtype_b.width
@@ -143,17 +156,17 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
         assert self.producer_threads % self.a_vectors_per_row == 0
         assert self.producer_threads % self.b_vectors_per_row == 0
 
-        a_rows_per_copy = self.producer_threads // self.a_vectors_per_row
-        b_rows_per_copy = self.producer_threads // self.b_vectors_per_row
-        assert self.tile_m % a_rows_per_copy == 0
-        assert self.tile_n % b_rows_per_copy == 0
+        self.a_rows_per_copy = self.producer_threads // self.a_vectors_per_row
+        self.b_rows_per_copy = self.producer_threads // self.b_vectors_per_row
+        assert self.tile_m % self.a_rows_per_copy == 0
+        assert self.tile_n % self.b_rows_per_copy == 0
 
         a_thread_layout = cute.make_layout(
-            (a_rows_per_copy, self.a_vectors_per_row),
+            (self.a_rows_per_copy, self.a_vectors_per_row),
             stride=(self.a_vectors_per_row, 1),
         )
         b_thread_layout = cute.make_layout(
-            (b_rows_per_copy, self.b_vectors_per_row),
+            (self.b_rows_per_copy, self.b_vectors_per_row),
             stride=(self.b_vectors_per_row, 1),
         )
         a_value_layout = cute.make_layout(
@@ -173,6 +186,29 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
             self.load_b_atom,
             b_thread_layout,
             b_value_layout,
+        )
+
+        scale_a_thread_layout = cute.make_layout(
+            (self.scale_a_per_tile,),
+            stride=(1,),
+        )
+        scale_b_thread_layout = cute.make_layout(
+            (self.scale_b_per_tile,),
+            stride=(1,),
+        )
+        scale_value_layout = cute.make_layout(
+            (1,),
+            stride=(1,),
+        )
+        self.tiled_copy_scale_a = cute.make_tiled_copy_tv(
+            self.load_scale_a_atom,
+            scale_a_thread_layout,
+            scale_value_layout,
+        )
+        self.tiled_copy_scale_b = cute.make_tiled_copy_tv(
+            self.load_scale_b_atom,
+            scale_b_thread_layout,
+            scale_value_layout,
         )
 
     def get_ab_s2r_atom(self) -> None:
@@ -196,12 +232,326 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
         self.tiled_copy_a_s2r = cute.make_tiled_copy_A(self.s2r_a_atom, self.tiled_mma)
         self.tiled_copy_b_s2r = cute.make_tiled_copy_B(self.s2r_b_atom, self.tiled_mma)
 
+    def get_shared_storage(self):
+        @cute.struct
+        class SharedStorage:
+            sA: cute.struct.Align[
+                cute.struct.MemRange[self.dtype_a, self.sA_size],
+                128,
+            ]
+            sB: cute.struct.Align[
+                cute.struct.MemRange[self.dtype_b, self.sB_size],
+                128,
+            ]
+            sScaleA: cute.struct.Align[
+                cute.struct.MemRange[self.scale_dtype, self.sScaleA_size],
+                16,
+            ]
+            sScaleB: cute.struct.Align[
+                cute.struct.MemRange[self.scale_dtype, self.sScaleB_size],
+                16,
+            ]
+            a_mbar: cute.struct.MemRange[cutlass.Int64, self.stages * 2]
+            b_mbar: cute.struct.MemRange[cutlass.Int64, self.stages * 2]
+
+        return SharedStorage
+
+    @cute.jit
+    def load(
+        self,
+        mA: cute.Tensor,
+        mScaleA: cute.Tensor,
+        mB: cute.Tensor,
+        mScaleB: cute.Tensor,
+        sA: cute.Tensor,
+        sScaleA: cute.Tensor,
+        sB: cute.Tensor,
+        sScaleB: cute.Tensor,
+        tiled_copy_a: cute.TiledCopy,
+        tiled_copy_scale_a: cute.TiledCopy,
+        tiled_copy_b: cute.TiledCopy,
+        tiled_copy_scale_b: cute.TiledCopy,
+        tile_m_idx: cutlass.Int32,
+        tile_n_idx: cutlass.Int32,
+        group_idx: cutlass.Int32,
+        valid_m: cutlass.Int32,
+        n: cutlass.Int32,
+        k_tile_count: cutlass.Int32,
+        a_pipeline: pipeline.PipelineCpAsync,
+        b_pipeline: pipeline.PipelineCpAsync,
+        a_producer_state: pipeline.PipelineState,
+        b_producer_state: pipeline.PipelineState,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+        producer_thread_idx = cute.arch.thread_idx()[0] - self.consumer_threads
+        local_m = producer_thread_idx // self.a_vectors_per_row
+        local_n = producer_thread_idx // self.b_vectors_per_row
+
+        gA = cute.local_tile(
+            mA[group_idx, None, None],
+            (self.tile_m, self.tile_k),
+            (tile_m_idx, None),
+        )
+        gB = cute.local_tile(
+            mB[group_idx, None, None],
+            (self.tile_n, self.tile_k),
+            (tile_n_idx, None),
+        )
+        gScaleA = cute.local_tile(
+            mScaleA[group_idx, None, None],
+            (self.scale_a_per_tile,),
+            (tile_m_idx, None),
+        )
+        scale_b_tile_idx = tile_n_idx // (self.recipe_b[0] // self.tile_n)
+        gScaleB = cute.local_tile(
+            mScaleB[group_idx, None, None],
+            (self.scale_b_per_tile,),
+            (scale_b_tile_idx, None),
+        )
+        gA = cute.make_tensor(gA.iterator.align(16), gA.layout)
+        gB = cute.make_tensor(gB.iterator.align(16), gB.layout)
+
+        a_thr_copy = tiled_copy_a.get_slice(producer_thread_idx)
+        tAgA = a_thr_copy.partition_S(gA)
+        tAsA = a_thr_copy.partition_D(sA)
+
+        b_thr_copy = tiled_copy_b.get_slice(producer_thread_idx)
+        tBgB = b_thr_copy.partition_S(gB)
+        tBsB = b_thr_copy.partition_D(sB)
+
+        scale_a_thr_copy = tiled_copy_scale_a.get_slice(producer_thread_idx % self.scale_a_per_tile)
+        tSAgScaleA = scale_a_thr_copy.partition_S(gScaleA)
+        tSAsScaleA = scale_a_thr_copy.partition_D(sScaleA)
+
+        scale_b_thr_copy = tiled_copy_scale_b.get_slice(0)
+        tSBgScaleB = scale_b_thr_copy.partition_S(gScaleB)
+        tSBsScaleB = scale_b_thr_copy.partition_D(sScaleB)
+
+        tApA = cute.make_rmem_tensor(
+            cute.make_layout(
+                (
+                    tAgA.shape[0][1],
+                    cute.size(tAgA, mode=[1]),
+                    cute.size(tAgA, mode=[2]),
+                ),
+                stride=(cute.size(tAgA, mode=[1]), 1, 0),
+            ),
+            cutlass.Boolean,
+        )
+        tBpB = cute.make_rmem_tensor(
+            cute.make_layout(
+                (
+                    tBgB.shape[0][1],
+                    cute.size(tBgB, mode=[1]),
+                    cute.size(tBgB, mode=[2]),
+                ),
+                stride=(cute.size(tBgB, mode=[1]), 1, 0),
+            ),
+            cutlass.Boolean,
+        )
+        for m_copy_idx in cutlass.range_constexpr(cute.size(tApA, mode=[1])):
+            m_idx = tile_m_idx * self.tile_m + local_m + m_copy_idx * self.a_rows_per_copy
+            tApA[None, m_copy_idx, None].fill(m_idx < valid_m)
+        for n_copy_idx in cutlass.range_constexpr(cute.size(tBpB, mode=[1])):
+            n_idx = tile_n_idx * self.tile_n + local_n + n_copy_idx * self.b_rows_per_copy
+            tBpB[None, n_copy_idx, None].fill(n_idx < n)
+
+        scale_a_m_idx = tile_m_idx * self.tile_m + producer_thread_idx
+
+        for k_tile_idx in cutlass.range(k_tile_count):
+            a_pipeline.producer_acquire(a_producer_state)
+            cute.copy(
+                tiled_copy_a,
+                tAgA[None, None, None, k_tile_idx],
+                tAsA[None, None, None, a_producer_state.index],
+                pred=tApA,
+            )
+            if producer_thread_idx < self.scale_a_per_tile and scale_a_m_idx < valid_m:
+                cute.copy(
+                    tiled_copy_scale_a,
+                    tSAgScaleA[None, None, k_tile_idx],
+                    tSAsScaleA[None, None, a_producer_state.index],
+                )
+            a_pipeline.producer_commit(a_producer_state)
+            a_producer_state.advance()
+
+            b_pipeline.producer_acquire(b_producer_state)
+            cute.copy(
+                tiled_copy_b,
+                tBgB[None, None, None, k_tile_idx],
+                tBsB[None, None, None, b_producer_state.index],
+                pred=tBpB,
+            )
+            if producer_thread_idx < self.scale_b_per_tile:
+                cute.copy(
+                    tiled_copy_scale_b,
+                    tSBgScaleB[None, None, k_tile_idx],
+                    tSBsScaleB[None, None, b_producer_state.index],
+                )
+            b_pipeline.producer_commit(b_producer_state)
+            b_producer_state.advance()
+
+        return a_producer_state, b_producer_state
+
+    @cute.jit
+    def drain(
+        self,
+        k_tile_count: cutlass.Int32,
+        a_pipeline: pipeline.PipelineCpAsync,
+        b_pipeline: pipeline.PipelineCpAsync,
+        a_consumer_state: pipeline.PipelineState,
+        b_consumer_state: pipeline.PipelineState,
+    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+        for _ in cutlass.range(k_tile_count):
+            a_pipeline.consumer_wait(a_consumer_state)
+            a_pipeline.consumer_release(a_consumer_state)
+            a_consumer_state.advance()
+            b_pipeline.consumer_wait(b_consumer_state)
+            b_pipeline.consumer_release(b_consumer_state)
+            b_consumer_state.advance()
+        return a_consumer_state, b_consumer_state
+
+    @cute.kernel
+    def kernel(
+        self,
+        mA: cute.Tensor,
+        mScaleA: cute.Tensor,
+        mB: cute.Tensor,
+        mScaleB: cute.Tensor,
+        mD: cute.Tensor,
+        mInfo: cute.Tensor,
+        sA_layout: cute.ComposedLayout,
+        sScaleA_layout: cute.Layout,
+        sB_layout: cute.ComposedLayout,
+        sScaleB_layout: cute.Layout,
+        tiled_copy_a: cute.TiledCopy,
+        tiled_copy_scale_a: cute.TiledCopy,
+        tiled_copy_b: cute.TiledCopy,
+        tiled_copy_scale_b: cute.TiledCopy,
+        SharedStorage: cutlass.Constexpr,
+    ) -> None:
+        groups, max_m, gemm_k = mA.shape
+        _, n, _ = mB.shape
+        num_tile_m = cute.ceil_div(max_m, self.tile_m)
+        num_tile_n = cute.ceil_div(n, self.tile_n)
+        k_tile_count = gemm_k // self.tile_k
+
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        is_consumer = warp_idx < self.num_consumer_warps
+        is_producer = warp_idx >= self.num_consumer_warps
+        is_producer &= warp_idx < self.num_consumer_warps + self.num_producer_warps
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sA = storage.sA.get_tensor(sA_layout.outer, swizzle=sA_layout.inner)
+        sB = storage.sB.get_tensor(sB_layout.outer, swizzle=sB_layout.inner)
+        sScaleA = storage.sScaleA.get_tensor(sScaleA_layout)
+        sScaleB = storage.sScaleB.get_tensor(sScaleB_layout)
+
+        producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            self.producer_threads,
+        )
+        consumer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            self.consumer_threads,
+        )
+        a_pipeline = pipeline.PipelineCpAsync.create(
+            barrier_storage=storage.a_mbar.data_ptr(),
+            num_stages=self.stages,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            defer_sync=True,
+        )
+        b_pipeline = pipeline.PipelineCpAsync.create(
+            barrier_storage=storage.b_mbar.data_ptr(),
+            num_stages=self.stages,
+            producer_group=producer_group,
+            consumer_group=consumer_group,
+            defer_sync=True,
+        )
+        pipeline.pipeline_init_arrive()
+        pipeline.pipeline_init_wait()
+
+        block_idx_x, _, _ = cute.arch.block_idx()
+        grid_dim_x, _, _ = cute.arch.grid_dim()
+        scheduler = PersistentTileScheduler.create(
+            self.tile_m,
+            self.use_block_swizzle,
+            self.block_swizzle_factor,
+            num_tile_m,
+            num_tile_n,
+            groups,
+            mInfo,
+            block_idx_x,
+            grid_dim_x,
+        )
+        a_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer,
+            self.stages,
+        )
+        b_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer,
+            self.stages,
+        )
+        a_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer,
+            self.stages,
+        )
+        b_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer,
+            self.stages,
+        )
+        work_tile = scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            tile_m_idx, tile_n_idx, group_idx = work_tile.tile_idx
+            valid_m = mInfo[group_idx]
+            if is_producer:
+                a_producer_state, b_producer_state = self.load(
+                    mA,
+                    mScaleA,
+                    mB,
+                    mScaleB,
+                    sA,
+                    sScaleA,
+                    sB,
+                    sScaleB,
+                    tiled_copy_a,
+                    tiled_copy_scale_a,
+                    tiled_copy_b,
+                    tiled_copy_scale_b,
+                    tile_m_idx,
+                    tile_n_idx,
+                    group_idx,
+                    valid_m,
+                    n,
+                    k_tile_count,
+                    a_pipeline,
+                    b_pipeline,
+                    a_producer_state,
+                    b_producer_state,
+                )
+            if is_consumer:
+                a_consumer_state, b_consumer_state = self.drain(
+                    k_tile_count,
+                    a_pipeline,
+                    b_pipeline,
+                    a_consumer_state,
+                    b_consumer_state,
+                )
+            work_tile = scheduler.advance_to_next_work()
+
+        if is_producer:
+            a_pipeline.producer_tail(a_producer_state)
+            b_pipeline.producer_tail(b_producer_state)
+
+        del mD
+
     def __call__(
         self,
         mA: cute.Tensor,
-        scale_a: cute.Tensor,
+        mScaleA: cute.Tensor,
         mB: cute.Tensor,
-        scale_b: cute.Tensor,
+        mScaleB: cute.Tensor,
         mD: cute.Tensor,
         mInfo: cute.Tensor,
         stream: cuda.CUstream,
@@ -210,8 +560,9 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
         self.get_mma_atom()
         self.get_tiled_mma()
         self.get_smem_layout()
-        self.get_ab_load()
+        self.get_g2s_load()
         self.get_ab_s2r()
+        self.get_shared_storage()
         groups, max_m, _ = mA.shape
         _, n, _ = mB.shape
         PersistentTileScheduler.get_grid_shape(
@@ -220,5 +571,5 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
             groups,
             self.max_persistent_ctas,
         )
-        del scale_a, scale_b, mD, mInfo, stream
-        raise NotImplementedError("FP8 scale loading and scaled MMA mainloop are not implemented")
+        del mScaleA, mScaleB, mD, mInfo, stream
+        raise NotImplementedError("FP8 scaled MMA consumer mainloop is not implemented")

@@ -95,7 +95,7 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         self.sA_size = cute.cosize(self.sA_layout)
         self.sB_size = cute.cosize(self.sB_layout)
 
-    def get_ab_load_atom(self) -> None:
+    def get_g2s_load_atom(self) -> None:
         self.num_bits_per_copy = 128
         self.load_a_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
@@ -108,8 +108,8 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
             num_bits_per_copy=self.num_bits_per_copy,
         )
 
-    def get_ab_load(self) -> None:
-        self.get_ab_load_atom()
+    def get_g2s_load(self) -> None:
+        self.get_g2s_load_atom()
 
         a_copy_elems = self.num_bits_per_copy // self.dtype_a.width
         b_copy_elems = self.num_bits_per_copy // self.dtype_b.width
@@ -183,7 +183,7 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         self.get_mma_atom()
         self.get_tiled_mma()
         self.get_smem_layout()
-        self.get_ab_load()
+        self.get_g2s_load()
         self.get_ab_s2r()
 
         @cute.struct
