@@ -393,22 +393,71 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
         return a_producer_state, b_producer_state
 
     @cute.jit
-    def drain(
+    def compute(
         self,
+        sA: cute.Tensor,
+        sB: cute.Tensor,
+        tiled_mma: cute.TiledMma,
+        tiled_copy_a_s2r: cute.TiledCopy,
+        tiled_copy_b_s2r: cute.TiledCopy,
         k_tile_count: cutlass.Int32,
         a_pipeline: pipeline.PipelineCpAsync,
         b_pipeline: pipeline.PipelineCpAsync,
         a_consumer_state: pipeline.PipelineState,
         b_consumer_state: pipeline.PipelineState,
-    ) -> tuple[pipeline.PipelineState, pipeline.PipelineState]:
+    ) -> tuple[cute.Tensor, pipeline.PipelineState, pipeline.PipelineState]:
+        consumer_thread_idx = cute.arch.thread_idx()[0]
+        thr_mma = tiled_mma.get_slice(consumer_thread_idx)
+
+        tCsA = thr_mma.partition_A(sA)
+        tCsB = thr_mma.partition_B(sB)
+        tCrA = tiled_mma.make_fragment_A(tCsA[None, None, None, 0])
+        tCrB = tiled_mma.make_fragment_B(tCsB[None, None, None, 0])
+
+        a_thr_copy = tiled_copy_a_s2r.get_slice(consumer_thread_idx)
+        tAsA = a_thr_copy.partition_S(sA)
+        tArA = a_thr_copy.retile(tCrA)
+
+        b_thr_copy = tiled_copy_b_s2r.get_slice(consumer_thread_idx)
+        tBsB = b_thr_copy.partition_S(sB)
+        tBrB = b_thr_copy.retile(tCrB)
+
+        num_mma_k_blocks = cute.size(tAsA, mode=[2])
+        assert num_mma_k_blocks == self.tile_k // self.mma_warp_tile_shape_mnk[2]
+        assert num_mma_k_blocks == cute.size(tBsB, mode=[2])
+
+        acc_shape = thr_mma.partition_shape_C((self.tile_m, self.tile_n))
+        accumulators = cute.make_rmem_tensor(acc_shape, self.dtype_acc)
+        accumulators.fill(0.0)
+
         for _ in cutlass.range(k_tile_count):
             a_pipeline.consumer_wait(a_consumer_state)
-            a_pipeline.consumer_release(a_consumer_state)
-            a_consumer_state.advance()
             b_pipeline.consumer_wait(b_consumer_state)
+
+            for mma_k_block in cutlass.range_constexpr(num_mma_k_blocks):
+                cute.copy(
+                    tiled_copy_a_s2r,
+                    tAsA[None, None, mma_k_block, a_consumer_state.index],
+                    tArA[None, None, mma_k_block],
+                )
+                cute.copy(
+                    tiled_copy_b_s2r,
+                    tBsB[None, None, mma_k_block, b_consumer_state.index],
+                    tBrB[None, None, mma_k_block],
+                )
+                cute.gemm(
+                    tiled_mma,
+                    accumulators,
+                    tCrA[None, None, mma_k_block],
+                    tCrB[None, None, mma_k_block],
+                    accumulators,
+                )
+
+            a_pipeline.consumer_release(a_consumer_state)
             b_pipeline.consumer_release(b_consumer_state)
+            a_consumer_state.advance()
             b_consumer_state.advance()
-        return a_consumer_state, b_consumer_state
+        return accumulators, a_consumer_state, b_consumer_state
 
     @cute.kernel
     def kernel(
@@ -427,6 +476,9 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
         tiled_copy_scale_a: cute.TiledCopy,
         tiled_copy_b: cute.TiledCopy,
         tiled_copy_scale_b: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+        tiled_copy_a_s2r: cute.TiledCopy,
+        tiled_copy_b_s2r: cute.TiledCopy,
         SharedStorage: cutlass.Constexpr,
     ) -> None:
         groups, max_m, gemm_k = mA.shape
@@ -531,7 +583,12 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
                     b_producer_state,
                 )
             if is_consumer:
-                a_consumer_state, b_consumer_state = self.drain(
+                _accumulators, a_consumer_state, b_consumer_state = self.compute(
+                    sA,
+                    sB,
+                    tiled_mma,
+                    tiled_copy_a_s2r,
+                    tiled_copy_b_s2r,
                     k_tile_count,
                     a_pipeline,
                     b_pipeline,
@@ -572,4 +629,4 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
             self.max_persistent_ctas,
         )
         del mScaleA, mScaleB, mD, mInfo, stream
-        raise NotImplementedError("FP8 scaled MMA consumer mainloop is not implemented")
+        raise NotImplementedError("FP8 accumulator scaling and BF16 epilogue are not implemented")
