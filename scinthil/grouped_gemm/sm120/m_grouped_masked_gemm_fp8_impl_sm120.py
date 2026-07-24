@@ -8,6 +8,7 @@ import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync
 
 from .group_gemm_base import GroupedGEMMBase
+from .grouped_gemm_utils import make_acc_tensor_mn_view
 from .scheduler import PersistentTileScheduler
 
 
@@ -396,10 +397,14 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
     def compute(
         self,
         sA: cute.Tensor,
+        sScaleA: cute.Tensor,
         sB: cute.Tensor,
+        sScaleB: cute.Tensor,
         tiled_mma: cute.TiledMma,
         tiled_copy_a_s2r: cute.TiledCopy,
         tiled_copy_b_s2r: cute.TiledCopy,
+        tile_m_idx: cutlass.Int32,
+        valid_m: cutlass.Int32,
         k_tile_count: cutlass.Int32,
         a_pipeline: pipeline.PipelineCpAsync,
         b_pipeline: pipeline.PipelineCpAsync,
@@ -427,12 +432,20 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
         assert num_mma_k_blocks == cute.size(tBsB, mode=[2])
 
         acc_shape = thr_mma.partition_shape_C((self.tile_m, self.tile_n))
-        accumulators = cute.make_rmem_tensor(acc_shape, self.dtype_acc)
-        accumulators.fill(0.0)
+        final_accumulators = cute.make_rmem_tensor(acc_shape, self.dtype_acc)
+        temporary_accumulators = cute.make_rmem_tensor(acc_shape, self.dtype_acc)
+        final_accumulators.fill(0.0)
+
+        final_accumulators_mn = make_acc_tensor_mn_view(final_accumulators)
+        temporary_accumulators_mn = make_acc_tensor_mn_view(temporary_accumulators)
+        assert cute.size(final_accumulators_mn, mode=[0]) == 2
+        assert cute.size(final_accumulators_mn, mode=[1]) == 4
+        lane_m = cute.arch.lane_idx() // 4
 
         for _ in cutlass.range(k_tile_count):
             a_pipeline.consumer_wait(a_consumer_state)
             b_pipeline.consumer_wait(b_consumer_state)
+            temporary_accumulators.fill(0.0)
 
             for mma_k_block in cutlass.range_constexpr(num_mma_k_blocks):
                 cute.copy(
@@ -447,17 +460,32 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
                 )
                 cute.gemm(
                     tiled_mma,
-                    accumulators,
+                    temporary_accumulators,
                     tCrA[None, None, mma_k_block],
                     tCrB[None, None, mma_k_block],
-                    accumulators,
+                    temporary_accumulators,
                 )
+
+            scale_b = sScaleB[0, b_consumer_state.index]
+            scale_a_0 = cutlass.Float32(0.0)
+            scale_a_1 = cutlass.Float32(0.0)
+            if tile_m_idx * self.tile_m + lane_m < valid_m:
+                scale_a_0 = sScaleA[lane_m, a_consumer_state.index]
+            if tile_m_idx * self.tile_m + lane_m + 8 < valid_m:
+                scale_a_1 = sScaleA[lane_m + 8, a_consumer_state.index]
 
             a_pipeline.consumer_release(a_consumer_state)
             b_pipeline.consumer_release(b_consumer_state)
             a_consumer_state.advance()
             b_consumer_state.advance()
-        return accumulators, a_consumer_state, b_consumer_state
+
+            scale_a = (scale_a_0, scale_a_1)
+            for row in cutlass.range_constexpr(cute.size(final_accumulators_mn, mode=[0])):
+                final_row = final_accumulators_mn[row, None]
+                temporary_row = temporary_accumulators_mn[row, None]
+                final_row.store(final_row.load() + temporary_row.load() * scale_a[row] * scale_b)
+
+        return final_accumulators, a_consumer_state, b_consumer_state
 
     @cute.kernel
     def kernel(
@@ -585,10 +613,14 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
             if is_consumer:
                 _accumulators, a_consumer_state, b_consumer_state = self.compute(
                     sA,
+                    sScaleA,
                     sB,
+                    sScaleB,
                     tiled_mma,
                     tiled_copy_a_s2r,
                     tiled_copy_b_s2r,
+                    tile_m_idx,
+                    valid_m,
                     k_tile_count,
                     a_pipeline,
                     b_pipeline,
@@ -629,4 +661,4 @@ class MGroupedMaskedGEMMFP8SM120(GroupedGEMMBase):
             self.max_persistent_ctas,
         )
         del mScaleA, mScaleB, mD, mInfo, stream
-        raise NotImplementedError("FP8 accumulator scaling and BF16 epilogue are not implemented")
+        raise NotImplementedError("FP8 BF16 epilogue is not implemented")
