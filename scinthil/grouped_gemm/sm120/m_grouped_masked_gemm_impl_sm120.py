@@ -150,7 +150,7 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
             b_value_layout,
         )
 
-    def get_ab_s2r_atom(self) -> None:
+    def get_s2r_atom(self) -> None:
         self.s2r_a_atom = cute.make_copy_atom(
             cute.nvgpu.warp.LdMatrix8x8x16bOp(
                 transpose=False,
@@ -166,8 +166,8 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
             self.dtype_b,
         )
 
-    def get_ab_s2r(self) -> None:
-        self.get_ab_s2r_atom()
+    def get_s2r_load(self) -> None:
+        self.get_s2r_atom()
         self.tiled_copy_a_s2r = cute.make_tiled_copy_A(self.s2r_a_atom, self.tiled_mma)
         self.tiled_copy_b_s2r = cute.make_tiled_copy_B(self.s2r_b_atom, self.tiled_mma)
 
@@ -184,7 +184,7 @@ class MGroupedMaskedGEMMSM120(GroupedGEMMBase):
         self.get_tiled_mma()
         self.get_smem_layout()
         self.get_g2s_load()
-        self.get_ab_s2r()
+        self.get_s2r_load()
 
         @cute.struct
         class SharedStorage:

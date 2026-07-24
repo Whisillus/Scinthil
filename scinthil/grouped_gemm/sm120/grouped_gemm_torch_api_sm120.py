@@ -1,4 +1,5 @@
 import cuda.bindings.driver as cuda
+import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
@@ -142,10 +143,8 @@ def m_grouped_masked_gemm_fp8_torch_sm120(
     _, _, tile_k = get_m_grouped_masked_gemm_fp8_tile()
     if gemm_k % tile_k != 0:
         raise ValueError(f"K must be divisible by {tile_k}")
-    if n % recipe_b[0] != 0:
-        raise ValueError(f"N must be divisible by {recipe_b[0]}")
     expected_scale_a_shape = (groups, max_m, gemm_k // recipe_a[1])
-    expected_scale_b_shape = (groups, n // recipe_b[0], gemm_k // recipe_b[1])
+    expected_scale_b_shape = (groups, cute.ceil_div(n, recipe_b[0]), gemm_k // recipe_b[1])
     if scale_a.shape != expected_scale_a_shape:
         raise ValueError(f"scale_a must have shape {expected_scale_a_shape}")
     if scale_b.shape != expected_scale_b_shape:

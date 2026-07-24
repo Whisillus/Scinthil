@@ -16,7 +16,7 @@ def get_m_grouped_masked_gemm_tile() -> tuple[int, int, int]:
 
 def get_m_grouped_masked_gemm_fp8_tile() -> tuple[int, int, int]:
     """Select the correctness-first CTA tile for SM120 FP8 grouped GEMM."""
-    return 16, 16, 128
+    return 32, 128, 128
 
 
 @cute.jit
@@ -106,9 +106,8 @@ def m_grouped_masked_gemm_fp8_sm120(
 
     tile_m, tile_n, tile_k = get_m_grouped_masked_gemm_fp8_tile()
     assert gemm_k % tile_k == 0
-    assert n % recipe_b[0] == 0
     assert mScaleA.shape == (groups, max_m, gemm_k // recipe_a[1])
-    assert mScaleB.shape == (groups, n // recipe_b[0], gemm_k // recipe_b[1])
+    assert mScaleB.shape == (groups, cute.ceil_div(n, recipe_b[0]), gemm_k // recipe_b[1])
     assert mA.stride[2] == 1 and mB.stride[2] == 1 and mD.stride[2] == 1
     assert mScaleA.stride[2] == 1 and mScaleB.stride[2] == 1
 

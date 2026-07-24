@@ -52,10 +52,10 @@ class GroupedGEMMBase:
     def get_g2s_load(self) -> None:
         raise NotImplementedError
 
-    def get_ab_s2r_atom(self) -> None:
+    def get_s2r_atom(self) -> None:
         raise NotImplementedError
 
-    def get_ab_s2r(self) -> None:
+    def get_s2r_load(self) -> None:
         raise NotImplementedError
 
     def get_mma_atom(self) -> None:
