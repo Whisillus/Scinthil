@@ -24,7 +24,6 @@ __global__ __launch_bounds__(256) void bandwidth_l1_cache_read_kernel(const T* i
   for (unsigned int index = threadIdx.x; index < elements_per_block; index += stride) {
     prime_value = ptx::ldg_ca_128bit<T>(block_input + index);
   }
-  __syncthreads();
 
   for (int pass{0}; pass < passes_per_launch; ++pass) {
     for (unsigned int index = threadIdx.x; index < elements_per_block; index += Unroll * stride) {

@@ -17,12 +17,20 @@ __global__ __launch_bounds__(256) void bandwidth_shared_memory_read_kernel(unsig
   constexpr unsigned int element_bytes = sizeof(T);
 
   const unsigned int stride = blockDim.x;
-  for (int pass{0}; pass < passes_per_launch; ++pass) {
-    for (unsigned int index = threadIdx.x; index < element_count; index += 4U * stride) {
-      ptx::lds_128bit_discard_result<T>(shared_address + index * element_bytes);
-      ptx::lds_128bit_discard_result<T>(shared_address + (index + stride) * element_bytes);
-      ptx::lds_128bit_discard_result<T>(shared_address + (index + 2U * stride) * element_bytes);
-      ptx::lds_128bit_discard_result<T>(shared_address + (index + 3U * stride) * element_bytes);
+  for (unsigned int index = threadIdx.x; index < element_count; index += 4U * stride) {
+    const unsigned int address0 = shared_address + index * element_bytes;
+    const unsigned int address1 = shared_address + (index + stride) * element_bytes;
+    const unsigned int address2 = shared_address + (index + 2U * stride) * element_bytes;
+    const unsigned int address3 = shared_address + (index + 3U * stride) * element_bytes;
+#pragma unroll 1
+    for (int pass{0}; pass < passes_per_launch; pass += SharedMemoryPassesPerLaunchGranularity) {
+#pragma unroll
+      for (int pass_offset{0}; pass_offset < SharedMemoryPassesPerLaunchGranularity; ++pass_offset) {
+        ptx::lds_128bit_discard_result<T>(address0);
+        ptx::lds_128bit_discard_result<T>(address1);
+        ptx::lds_128bit_discard_result<T>(address2);
+        ptx::lds_128bit_discard_result<T>(address3);
+      }
     }
   }
 }

@@ -169,7 +169,8 @@ inline void print_usage(const char* program) {
         std::fprintf(stderr, "--passes-per-launch is not valid for this benchmark\n");
         return ParseResult::Error;
       }
-      if (!parse_number(argv[++index], 1, std::numeric_limits<int>::max(), value)) {
+      if (!parse_number(argv[++index], 1, std::numeric_limits<int>::max(), value) ||
+          (is_shared_memory_benchmark(arguments.benchmark) && value % SharedMemoryPassesPerLaunchGranularity != 0)) {
         std::fprintf(stderr, "invalid --passes-per-launch value\n");
         return ParseResult::Error;
       }

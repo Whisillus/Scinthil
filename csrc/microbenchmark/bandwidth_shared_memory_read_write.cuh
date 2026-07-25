@@ -17,20 +17,24 @@ __global__ __launch_bounds__(256) void bandwidth_shared_memory_read_write_kernel
   constexpr unsigned int element_bytes = sizeof(T);
 
   const unsigned int stride = blockDim.x;
-  for (int pass{0}; pass < passes_per_launch; ++pass) {
-    for (unsigned int index = threadIdx.x; index < element_count; index += 4U * stride) {
-      const unsigned int address0 = shared_address + index * element_bytes;
-      const unsigned int address1 = shared_address + (index + stride) * element_bytes;
-      const unsigned int address2 = shared_address + (index + 2U * stride) * element_bytes;
-      const unsigned int address3 = shared_address + (index + 3U * stride) * element_bytes;
-      const T value0 = ptx::lds_128bit<T>(address0);
-      const T value1 = ptx::lds_128bit<T>(address1);
-      const T value2 = ptx::lds_128bit<T>(address2);
-      const T value3 = ptx::lds_128bit<T>(address3);
-      ptx::sts_128bit(address0, value0);
-      ptx::sts_128bit(address1, value1);
-      ptx::sts_128bit(address2, value2);
-      ptx::sts_128bit(address3, value3);
+  for (unsigned int index = threadIdx.x; index < element_count; index += 4U * stride) {
+    const unsigned int address0 = shared_address + index * element_bytes;
+    const unsigned int address1 = shared_address + (index + stride) * element_bytes;
+    const unsigned int address2 = shared_address + (index + 2U * stride) * element_bytes;
+    const unsigned int address3 = shared_address + (index + 3U * stride) * element_bytes;
+#pragma unroll 1
+    for (int pass{0}; pass < passes_per_launch; pass += SharedMemoryPassesPerLaunchGranularity) {
+#pragma unroll
+      for (int pass_offset{0}; pass_offset < SharedMemoryPassesPerLaunchGranularity; ++pass_offset) {
+        const T value0 = ptx::lds_128bit<T>(address0);
+        const T value1 = ptx::lds_128bit<T>(address1);
+        const T value2 = ptx::lds_128bit<T>(address2);
+        const T value3 = ptx::lds_128bit<T>(address3);
+        ptx::sts_128bit(address0, value0);
+        ptx::sts_128bit(address1, value1);
+        ptx::sts_128bit(address2, value2);
+        ptx::sts_128bit(address3, value3);
+      }
     }
   }
 }

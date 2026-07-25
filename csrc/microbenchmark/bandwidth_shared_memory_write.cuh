@@ -19,17 +19,21 @@ __global__ __launch_bounds__(256) void bandwidth_shared_memory_write_kernel(unsi
   const unsigned int thread_value = blockIdx.x * blockDim.x + threadIdx.x;
   T value = make_uint4(thread_value, thread_value + 1U, thread_value + 2U, thread_value + 3U);
   const unsigned int stride = blockDim.x;
-  for (int pass{0}; pass < passes_per_launch; ++pass) {
-    for (unsigned int index = threadIdx.x; index < element_count; index += 4U * stride) {
-      ptx::sts_128bit(shared_address + index * element_bytes, value);
-      ptx::sts_128bit(shared_address + (index + stride) * element_bytes, value);
-      ptx::sts_128bit(shared_address + (index + 2U * stride) * element_bytes, value);
-      ptx::sts_128bit(shared_address + (index + 3U * stride) * element_bytes, value);
+  for (unsigned int index = threadIdx.x; index < element_count; index += 4U * stride) {
+    const unsigned int address0 = shared_address + index * element_bytes;
+    const unsigned int address1 = shared_address + (index + stride) * element_bytes;
+    const unsigned int address2 = shared_address + (index + 2U * stride) * element_bytes;
+    const unsigned int address3 = shared_address + (index + 3U * stride) * element_bytes;
+#pragma unroll 1
+    for (int pass{0}; pass < passes_per_launch; pass += SharedMemoryPassesPerLaunchGranularity) {
+#pragma unroll
+      for (int pass_offset{0}; pass_offset < SharedMemoryPassesPerLaunchGranularity; ++pass_offset) {
+        ptx::sts_128bit(address0, value);
+        ptx::sts_128bit(address1, value);
+        ptx::sts_128bit(address2, value);
+        ptx::sts_128bit(address3, value);
+      }
     }
-    value.x += 0x9e3779b9U;
-    value.y += 0x9e3779b9U;
-    value.z += 0x9e3779b9U;
-    value.w += 0x9e3779b9U;
   }
 }
 

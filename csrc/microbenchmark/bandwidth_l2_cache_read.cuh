@@ -13,17 +13,17 @@ namespace scinthil::microbenchmark {
 
 template <typename T>
 __global__ __launch_bounds__(256) void bandwidth_l2_cache_read_kernel(const T* input, T* output,
-                                                                      std::size_t element_count,
+                                                                      unsigned int element_count,
                                                                       int passes_per_launch) {
-  const std::size_t thread_index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::size_t thread_count = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  const unsigned int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int thread_count = gridDim.x * blockDim.x;
   T last_value0 = make_uint4(0U, 0U, 0U, 0U);
   T last_value1 = make_uint4(0U, 0U, 0U, 0U);
   T last_value2 = make_uint4(0U, 0U, 0U, 0U);
   T last_value3 = make_uint4(0U, 0U, 0U, 0U);
 
   for (int pass{0}; pass < passes_per_launch; ++pass) {
-    for (std::size_t index = thread_index; index < element_count; index += 4U * thread_count) {
+    for (unsigned int index = thread_index; index < element_count; index += 4U * thread_count) {
       last_value0 = ptx::ldg_cg_128bit<T>(input + index);
       last_value1 = ptx::ldg_cg_128bit<T>(input + index + thread_count);
       last_value2 = ptx::ldg_cg_128bit<T>(input + index + 2U * thread_count);
@@ -74,9 +74,9 @@ __global__ __launch_bounds__(256) void bandwidth_l2_cache_read_kernel(const T* i
 
   auto* input = static_cast<T*>(resources.input);
   auto* output = static_cast<T*>(resources.output);
-  const std::size_t element_count = working_set_bytes / sizeof(T);
+  const unsigned int element_count = static_cast<unsigned int>(working_set_bytes / sizeof(T));
   const dim3 blocks{block_count, 1U, 1U};
-  assert(element_count % (4U * static_cast<std::size_t>(block_count) * threads.x) == 0);
+  assert(element_count % (4U * block_count * threads.x) == 0);
 
   float elapsed_ms{0.0F};
   if (!measure(

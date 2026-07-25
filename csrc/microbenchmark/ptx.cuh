@@ -73,7 +73,7 @@ template <typename T>
   static_assert(sizeof(T) == 16);
   static_assert(alignof(T) >= 16);
   T value;
-  asm volatile("ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
+  asm volatile("ld.volatile.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
                : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
                : "r"(address)
                : "memory");
