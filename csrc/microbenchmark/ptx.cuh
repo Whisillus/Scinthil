@@ -31,6 +31,30 @@ __device__ __forceinline__ void ldg_128bit_discard_result(const T* input) {
 }
 
 template <typename T>
+[[nodiscard]] __device__ __forceinline__ T ldg_ca_128bit(const T* input) {
+  static_assert(sizeof(T) == 16);
+  static_assert(alignof(T) >= 16);
+  T value;
+  asm volatile("ld.global.ca.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+               : "l"(input)
+               : "memory");
+  return value;
+}
+
+template <typename T>
+[[nodiscard]] __device__ __forceinline__ T ldg_cg_128bit(const T* input) {
+  static_assert(sizeof(T) == 16);
+  static_assert(alignof(T) >= 16);
+  T value;
+  asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+               : "l"(input)
+               : "memory");
+  return value;
+}
+
+template <typename T>
 __device__ __forceinline__ void stg_128bit(T* output, T value) {
   static_assert(sizeof(T) == 16);
   static_assert(alignof(T) >= 16);

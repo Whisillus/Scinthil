@@ -11,6 +11,7 @@ namespace scinthil::microbenchmark {
 
 inline constexpr std::size_t Byte2KByte{1024U};
 inline constexpr std::size_t Byte2MByte{1024U * 1024U};
+inline constexpr std::size_t L1CacheDefaultSizeKib{48U};
 inline constexpr std::size_t SharedMemoryMinimumSizeKib{4U};
 
 struct RunMicrobenchmarkOptions {

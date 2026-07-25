@@ -8,6 +8,8 @@
 #include "bandwidth_global_memory_read.cuh"
 #include "bandwidth_global_memory_read_write.cuh"
 #include "bandwidth_global_memory_write.cuh"
+#include "bandwidth_l1_cache_read.cuh"
+#include "bandwidth_l2_cache_read.cuh"
 #include "bandwidth_shared_memory_read.cuh"
 #include "bandwidth_shared_memory_read_write.cuh"
 #include "bandwidth_shared_memory_write.cuh"
@@ -28,6 +30,8 @@ struct BandwidthResourceRequirements {
       return {.needs_input = false, .needs_output = true};
     case Benchmark::GlobalMemoryReadWrite:
       return {.needs_input = true, .needs_output = true};
+    case Benchmark::L1CacheRead:
+    case Benchmark::L2CacheRead:
     case Benchmark::SharedMemoryRead:
     case Benchmark::SharedMemoryWrite:
     case Benchmark::SharedMemoryReadWrite:
@@ -52,6 +56,10 @@ struct BandwidthResourceRequirements {
       return run_bandwidth_global_memory_write(arguments.options, properties, resources);
     case Benchmark::GlobalMemoryReadWrite:
       return run_bandwidth_global_memory_read_write(arguments.options, properties, resources);
+    case Benchmark::L1CacheRead:
+      return run_bandwidth_l1_cache_read(arguments.options, properties, resources);
+    case Benchmark::L2CacheRead:
+      return run_bandwidth_l2_cache_read(arguments.options, properties, resources);
     case Benchmark::SharedMemoryRead:
       return run_bandwidth_shared_memory_read(arguments.options, properties, resources);
     case Benchmark::SharedMemoryWrite:
