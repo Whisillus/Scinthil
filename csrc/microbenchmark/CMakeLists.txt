@@ -6,5 +6,9 @@ scinthil_add_cuda_executable(
   bandwidth_global_memory_read_write.cuh
   bandwidth_global_memory_write.cuh
   bandwidth_microbenchmark.cuh
+  bandwidth_shared_memory_read.cuh
+  bandwidth_shared_memory_read_write.cuh
+  bandwidth_shared_memory_write.cuh
   bandwidth_utils.cuh
+  ptx.cuh
   utils.cuh)

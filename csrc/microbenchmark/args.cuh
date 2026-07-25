@@ -15,6 +15,9 @@ enum class Benchmark {
   GlobalMemoryRead,
   GlobalMemoryWrite,
   GlobalMemoryReadWrite,
+  SharedMemoryRead,
+  SharedMemoryWrite,
+  SharedMemoryReadWrite,
 };
 
 struct Arguments {
@@ -30,9 +33,12 @@ enum class ParseResult {
 
 inline void print_usage(const char* program) {
   std::printf(
-      "Usage: %s <global-memory-read|global-memory-write|global-memory-read-write> "
-      "[--size-mib N] [--warmup N] [--repeats N] [--device N]\n",
-      program);
+      "Usage:\n"
+      "  %s <global-memory-read|global-memory-write|global-memory-read-write> "
+      "[--size-mib N] [--warmup N] [--repeats N] [--device N]\n"
+      "  %s <shared-memory-read|shared-memory-write|shared-memory-read-write> "
+      "[--size-kib N] [--sweeps N] [--warmup N] [--repeats N] [--device N]\n",
+      program, program);
 }
 
 [[nodiscard]] inline bool parse_number(const char* text, unsigned long long minimum, unsigned long long maximum,
@@ -57,10 +63,26 @@ inline void print_usage(const char* program) {
     *benchmark = Benchmark::GlobalMemoryWrite;
   } else if (std::strcmp(text, "global-memory-read-write") == 0) {
     *benchmark = Benchmark::GlobalMemoryReadWrite;
+  } else if (std::strcmp(text, "shared-memory-read") == 0) {
+    *benchmark = Benchmark::SharedMemoryRead;
+  } else if (std::strcmp(text, "shared-memory-write") == 0) {
+    *benchmark = Benchmark::SharedMemoryWrite;
+  } else if (std::strcmp(text, "shared-memory-read-write") == 0) {
+    *benchmark = Benchmark::SharedMemoryReadWrite;
   } else {
     return false;
   }
   return true;
+}
+
+[[nodiscard]] inline bool is_global_memory_benchmark(Benchmark benchmark) {
+  return benchmark == Benchmark::GlobalMemoryRead || benchmark == Benchmark::GlobalMemoryWrite ||
+         benchmark == Benchmark::GlobalMemoryReadWrite;
+}
+
+[[nodiscard]] inline bool is_shared_memory_benchmark(Benchmark benchmark) {
+  return benchmark == Benchmark::SharedMemoryRead || benchmark == Benchmark::SharedMemoryWrite ||
+         benchmark == Benchmark::SharedMemoryReadWrite;
 }
 
 [[nodiscard]] inline ParseResult parse_arguments(int argc, char** argv, Arguments* arguments) {
@@ -87,11 +109,36 @@ inline void print_usage(const char* program) {
 
     unsigned long long value{0};
     if (std::strcmp(argv[index], "--size-mib") == 0) {
+      if (!is_global_memory_benchmark(arguments->benchmark)) {
+        std::fprintf(stderr, "--size-mib is only valid for global-memory benchmarks\n");
+        return ParseResult::Error;
+      }
       if (!parse_number(argv[++index], 1, std::numeric_limits<std::size_t>::max() / Byte2MByte, &value)) {
         std::fprintf(stderr, "invalid --size-mib value\n");
         return ParseResult::Error;
       }
       arguments->options.size_mib = static_cast<std::size_t>(value);
+    } else if (std::strcmp(argv[index], "--size-kib") == 0) {
+      if (!is_shared_memory_benchmark(arguments->benchmark)) {
+        std::fprintf(stderr, "--size-kib is only valid for shared-memory benchmarks\n");
+        return ParseResult::Error;
+      }
+      if (!parse_number(argv[++index], SharedMemoryMinimumSizeKib, std::numeric_limits<std::size_t>::max() / Byte2KByte,
+                        &value)) {
+        std::fprintf(stderr, "invalid --size-kib value\n");
+        return ParseResult::Error;
+      }
+      arguments->options.size_kib = static_cast<std::size_t>(value);
+    } else if (std::strcmp(argv[index], "--sweeps") == 0) {
+      if (!is_shared_memory_benchmark(arguments->benchmark)) {
+        std::fprintf(stderr, "--sweeps is only valid for shared-memory benchmarks\n");
+        return ParseResult::Error;
+      }
+      if (!parse_number(argv[++index], 1, std::numeric_limits<int>::max(), &value)) {
+        std::fprintf(stderr, "invalid --sweeps value\n");
+        return ParseResult::Error;
+      }
+      arguments->options.sweeps = static_cast<int>(value);
     } else if (std::strcmp(argv[index], "--warmup") == 0) {
       if (!parse_number(argv[++index], 1, std::numeric_limits<int>::max(), &value)) {
         std::fprintf(stderr, "invalid --warmup value\n");

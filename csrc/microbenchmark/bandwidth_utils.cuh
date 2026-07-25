@@ -10,13 +10,14 @@
 namespace scinthil::microbenchmark {
 
 inline void print_bandwidth_benchmark_result(const char* name, const RunMicrobenchmarkOptions& options,
-                                             const cudaDeviceProp& properties, float elapsed_ms,
-                                             double traffic_multiplier) {
+                                             const cudaDeviceProp& properties, std::size_t workspace_count,
+                                             float elapsed_ms, double traffic_multiplier) {
   const double total_bytes = traffic_multiplier * static_cast<double>(options.size_mib * Byte2MByte) * options.repeats;
   const double bandwidth_gb_s = total_bytes / (static_cast<double>(elapsed_ms) / 1000.0) / 1.0e9;
-  std::printf("%s: device=%d (%s), size=%zu MiB, traffic=%.0fx, repeats=%d, average=%.3f ms, %.2f GB/s\n", name,
-              options.device, properties.name, options.size_mib, traffic_multiplier, options.repeats,
-              elapsed_ms / options.repeats, bandwidth_gb_s);
+  std::printf(
+      "%s: device=%d (%s), size=%zu MiB, workspaces=%zu, traffic=%.0fx, repeats=%d, average=%.3f ms, %.2f GB/s\n", name,
+      options.device, properties.name, options.size_mib, workspace_count, traffic_multiplier, options.repeats,
+      elapsed_ms / options.repeats, bandwidth_gb_s);
 }
 
 struct BandwidthResources {
@@ -25,6 +26,7 @@ struct BandwidthResources {
   cudaEvent_t start{nullptr};
   cudaEvent_t stop{nullptr};
   cudaStream_t stream{nullptr};
+  std::size_t workspace_count{1};
 
   [[nodiscard]] bool initialize_resources(const RunMicrobenchmarkOptions& options, bool needs_input, bool needs_output,
                                           cudaDeviceProp* properties) {
@@ -35,6 +37,19 @@ struct BandwidthResources {
     if (!SCINTHIL_CUDA_CHECK(cudaGetDeviceProperties(properties, options.device))) {
       return false;
     }
+
+    const std::size_t buffer_count = static_cast<std::size_t>(needs_input) + static_cast<std::size_t>(needs_output);
+    if (buffer_count > 0 && properties->l2CacheSize > 0) {
+      const std::size_t rotation_bytes = 3U * static_cast<std::size_t>(properties->l2CacheSize);
+      if (bytes < rotation_bytes) {
+        const std::size_t bytes_per_workspace = bytes * buffer_count;
+        if (bytes_per_workspace < rotation_bytes) {
+          workspace_count = 1U + rotation_bytes / bytes_per_workspace;
+        }
+      }
+    }
+    const std::size_t allocation_bytes = bytes * workspace_count;
+
     if (!SCINTHIL_CUDA_CHECK(cudaStreamCreate(&stream))) {
       return false;
     }
@@ -45,14 +60,14 @@ struct BandwidthResources {
       return false;
     }
     if (needs_input) {
-      if (!SCINTHIL_CUDA_CHECK(cudaMalloc(&input, bytes))) {
+      if (!SCINTHIL_CUDA_CHECK(cudaMalloc(&input, allocation_bytes))) {
         return false;
       }
-      if (!SCINTHIL_CUDA_CHECK(cudaMemsetAsync(input, 1, bytes, stream))) {
+      if (!SCINTHIL_CUDA_CHECK(cudaMemsetAsync(input, 1, allocation_bytes, stream))) {
         return false;
       }
     }
-    if (needs_output && !SCINTHIL_CUDA_CHECK(cudaMalloc(&output, bytes))) {
+    if (needs_output && !SCINTHIL_CUDA_CHECK(cudaMalloc(&output, allocation_bytes))) {
       return false;
     }
     return true;
@@ -81,5 +96,60 @@ struct BandwidthResources {
     return success;
   }
 };
+
+template <typename Kernel>
+[[nodiscard]] bool prepare_shared_memory_launch(Kernel kernel, const RunMicrobenchmarkOptions& options,
+                                                const cudaDeviceProp& properties, const dim3& threads, dim3* blocks) {
+  const std::size_t shared_memory_bytes = options.size_kib * Byte2KByte;
+  const std::size_t maximum_shared_memory_bytes =
+      properties.sharedMemPerBlockOptin > 0 ? properties.sharedMemPerBlockOptin : properties.sharedMemPerBlock;
+  if (shared_memory_bytes < static_cast<std::size_t>(threads.x) * sizeof(uint4)) {
+    std::fprintf(stderr, "requested shared-memory size must be at least %zu KiB\n", SharedMemoryMinimumSizeKib);
+    return false;
+  }
+  if (shared_memory_bytes > maximum_shared_memory_bytes) {
+    std::fprintf(stderr, "requested shared-memory size exceeds the device per-block limit (%zu bytes)\n",
+                 maximum_shared_memory_bytes);
+    return false;
+  }
+
+  if (!SCINTHIL_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                                cudaSharedmemCarveoutMaxShared))) {
+    return false;
+  }
+  if (shared_memory_bytes > properties.sharedMemPerBlock &&
+      !SCINTHIL_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                static_cast<int>(shared_memory_bytes)))) {
+    return false;
+  }
+
+  int active_blocks_per_multiprocessor{0};
+  if (!SCINTHIL_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_multiprocessor, kernel,
+                                                                         threads.x, shared_memory_bytes))) {
+    return false;
+  }
+  if (active_blocks_per_multiprocessor <= 0) {
+    std::fprintf(stderr, "could not determine a valid shared-memory launch size\n");
+    return false;
+  }
+
+  const std::size_t block_count =
+      static_cast<std::size_t>(active_blocks_per_multiprocessor) * properties.multiProcessorCount;
+  *blocks = dim3{static_cast<unsigned int>(block_count), 1, 1};
+  return true;
+}
+
+inline void print_shared_memory_bandwidth_benchmark_result(const char* name, const RunMicrobenchmarkOptions& options,
+                                                           const cudaDeviceProp& properties, unsigned int block_count,
+                                                           float elapsed_ms, double traffic_multiplier) {
+  const double total_bytes = traffic_multiplier * static_cast<double>(options.size_kib * Byte2KByte) * block_count *
+                             options.sweeps * options.repeats;
+  const double bandwidth_gb_s = total_bytes / (static_cast<double>(elapsed_ms) / 1000.0) / 1.0e9;
+  std::printf(
+      "%s: device=%d (%s), size=%zu KiB/block, blocks=%u, sweeps=%d, traffic=%.0fx, repeats=%d, average=%.3f ms, "
+      "%.2f GB/s\n",
+      name, options.device, properties.name, options.size_kib, block_count, options.sweeps, traffic_multiplier,
+      options.repeats, elapsed_ms / options.repeats, bandwidth_gb_s);
+}
 
 }  // namespace scinthil::microbenchmark

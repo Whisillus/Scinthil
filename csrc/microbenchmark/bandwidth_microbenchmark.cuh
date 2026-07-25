@@ -8,6 +8,9 @@
 #include "bandwidth_global_memory_read.cuh"
 #include "bandwidth_global_memory_read_write.cuh"
 #include "bandwidth_global_memory_write.cuh"
+#include "bandwidth_shared_memory_read.cuh"
+#include "bandwidth_shared_memory_read_write.cuh"
+#include "bandwidth_shared_memory_write.cuh"
 #include "bandwidth_utils.cuh"
 
 namespace scinthil::microbenchmark {
@@ -25,6 +28,10 @@ struct BandwidthResourceRequirements {
       return {.needs_input = false, .needs_output = true};
     case Benchmark::GlobalMemoryReadWrite:
       return {.needs_input = true, .needs_output = true};
+    case Benchmark::SharedMemoryRead:
+    case Benchmark::SharedMemoryWrite:
+    case Benchmark::SharedMemoryReadWrite:
+      return {};
   }
   return {};
 }
@@ -45,6 +52,12 @@ struct BandwidthResourceRequirements {
       return run_bandwidth_global_memory_write(arguments.options, properties, resources);
     case Benchmark::GlobalMemoryReadWrite:
       return run_bandwidth_global_memory_read_write(arguments.options, properties, resources);
+    case Benchmark::SharedMemoryRead:
+      return run_bandwidth_shared_memory_read(arguments.options, properties, resources);
+    case Benchmark::SharedMemoryWrite:
+      return run_bandwidth_shared_memory_write(arguments.options, properties, resources);
+    case Benchmark::SharedMemoryReadWrite:
+      return run_bandwidth_shared_memory_read_write(arguments.options, properties, resources);
   }
   std::fprintf(stderr, "invalid bandwidth benchmark selection\n");
   return false;

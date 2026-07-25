@@ -6,6 +6,7 @@
 #include <cstdio>
 
 #include "bandwidth_utils.cuh"
+#include "ptx.cuh"
 
 namespace scinthil::microbenchmark {
 
@@ -14,26 +15,23 @@ __global__ void bandwidth_global_memory_write_kernel(T* output, std::size_t elem
   const std::size_t thread_index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const std::size_t thread_count = static_cast<std::size_t>(gridDim.x) * blockDim.x;
   for (std::size_t index = thread_index; index < element_count; index += thread_count) {
-    output[index] = value;
+    ptx::stg_128bit(output + index, value);
   }
 }
 
 [[nodiscard]] inline bool run_bandwidth_global_memory_write(const RunMicrobenchmarkOptions& options,
                                                             const cudaDeviceProp& properties,
                                                             BandwidthResources* resources) {
+  using T = uint4;
   const std::size_t bytes = options.size_mib * Byte2MByte;
-  const std::size_t element_count = bytes / sizeof(uint4);
-  auto* output = static_cast<uint4*>(resources->output);
-  const uint4 value = make_uint4(0x12345678U, 0x9abcdef0U, 0x55aa55aaU, 0xa55aa55aU);
+  const std::size_t element_count = bytes / sizeof(T);
+  auto* output = static_cast<T*>(resources->output);
+  const T value = make_uint4(0x12345678U, 0x9abcdef0U, 0x55aa55aaU, 0xa55aa55aU);
 
-  int minimum_num_blocks{0};
+  int minimum_grid_size{0};
   int num_threads_x{0};
-  if (!SCINTHIL_CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(&minimum_num_blocks, &num_threads_x,
-                                                              bandwidth_global_memory_write_kernel<uint4>, 0, 0))) {
-    return false;
-  }
-  if (minimum_num_blocks <= 0 || num_threads_x <= 0) {
-    std::fprintf(stderr, "could not determine a valid global-memory write launch size\n");
+  if (!SCINTHIL_CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(&minimum_grid_size, &num_threads_x,
+                                                              bandwidth_global_memory_write_kernel<T>, 0, 0))) {
     return false;
   }
   const dim3 threads{static_cast<unsigned int>(num_threads_x), 1, 1};
@@ -48,16 +46,18 @@ __global__ void bandwidth_global_memory_write_kernel(T* output, std::size_t elem
   float elapsed_ms{0.0F};
   if (!measure(
           options, resources,
-          [=] {
-            bandwidth_global_memory_write_kernel<uint4>
-                <<<blocks, threads, 0, resources->stream>>>(output, element_count, value);
+          [=](std::size_t launch_index) {
+            const std::size_t workspace_index = launch_index % resources->workspace_count;
+            bandwidth_global_memory_write_kernel<T><<<blocks, threads, 0, resources->stream>>>(
+                output + workspace_index * element_count, element_count, value);
             return SCINTHIL_CUDA_CHECK(cudaGetLastError());
           },
           &elapsed_ms)) {
     return false;
   }
 
-  print_bandwidth_benchmark_result("global-memory write-only", options, properties, elapsed_ms, 1.0);
+  print_bandwidth_benchmark_result("global-memory write-only", options, properties, resources->workspace_count,
+                                   elapsed_ms, 1.0);
   return true;
 }
 
