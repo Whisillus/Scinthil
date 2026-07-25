@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cassert>
 #include <cstddef>
 #include <cstdio>
 
@@ -106,6 +107,7 @@ template <typename Kernel>
 [[nodiscard]] bool prepare_shared_memory_launch(Kernel kernel, const RunMicrobenchmarkOptions& options,
                                                 const cudaDeviceProp& properties, const dim3& threads, dim3& blocks) {
   const std::size_t shared_memory_bytes = options.shared_kib_per_block * Byte2KByte;
+  assert(shared_memory_bytes % (4U * threads.x * sizeof(uint4)) == 0);
   const std::size_t maximum_shared_memory_bytes = properties.sharedMemPerBlockOptin;
   if (shared_memory_bytes > maximum_shared_memory_bytes) {
     std::fprintf(stderr, "requested shared-memory size exceeds the device per-block limit (%zu bytes)\n",

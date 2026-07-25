@@ -20,15 +20,11 @@ __global__ __launch_bounds__(256) void bandwidth_shared_memory_write_kernel(unsi
   T value = make_uint4(thread_value, thread_value + 1U, thread_value + 2U, thread_value + 3U);
   const unsigned int stride = blockDim.x;
   for (int pass{0}; pass < passes_per_launch; ++pass) {
-    unsigned int index = threadIdx.x;
-    for (; index + 3U * stride < element_count; index += 4U * stride) {
+    for (unsigned int index = threadIdx.x; index < element_count; index += 4U * stride) {
       ptx::sts_128bit(shared_address + index * element_bytes, value);
       ptx::sts_128bit(shared_address + (index + stride) * element_bytes, value);
       ptx::sts_128bit(shared_address + (index + 2U * stride) * element_bytes, value);
       ptx::sts_128bit(shared_address + (index + 3U * stride) * element_bytes, value);
-    }
-    for (; index < element_count; index += stride) {
-      ptx::sts_128bit(shared_address + index * element_bytes, value);
     }
     value.x += 0x9e3779b9U;
     value.y += 0x9e3779b9U;

@@ -18,15 +18,11 @@ __global__ __launch_bounds__(256) void bandwidth_shared_memory_read_kernel(unsig
 
   const unsigned int stride = blockDim.x;
   for (int pass{0}; pass < passes_per_launch; ++pass) {
-    unsigned int index = threadIdx.x;
-    for (; index + 3U * stride < element_count; index += 4U * stride) {
+    for (unsigned int index = threadIdx.x; index < element_count; index += 4U * stride) {
       ptx::lds_128bit_discard_result<T>(shared_address + index * element_bytes);
       ptx::lds_128bit_discard_result<T>(shared_address + (index + stride) * element_bytes);
       ptx::lds_128bit_discard_result<T>(shared_address + (index + 2U * stride) * element_bytes);
       ptx::lds_128bit_discard_result<T>(shared_address + (index + 3U * stride) * element_bytes);
-    }
-    for (; index < element_count; index += stride) {
-      ptx::lds_128bit_discard_result<T>(shared_address + index * element_bytes);
     }
   }
 }

@@ -136,7 +136,7 @@ inline void print_usage(const char* program) {
         std::fprintf(stderr, "--l1-kib-per-sm is not valid for this benchmark\n");
         return ParseResult::Error;
       }
-      if (!parse_number(argv[++index], SharedMemoryMinimumSizeKib, std::numeric_limits<std::size_t>::max() / Byte2KByte,
+      if (!parse_number(argv[++index], L1CacheMinimumSizeKib, std::numeric_limits<std::size_t>::max() / Byte2KByte,
                         value)) {
         std::fprintf(stderr, "invalid --l1-kib-per-sm value\n");
         return ParseResult::Error;
@@ -157,8 +157,9 @@ inline void print_usage(const char* program) {
         std::fprintf(stderr, "--shared-kib-per-block is not valid for this benchmark\n");
         return ParseResult::Error;
       }
-      if (!parse_number(argv[++index], SharedMemoryMinimumSizeKib, std::numeric_limits<std::size_t>::max() / Byte2KByte,
-                        value)) {
+      if (!parse_number(argv[++index], SharedMemorySizeGranularityKib,
+                        std::numeric_limits<std::size_t>::max() / Byte2KByte, value) ||
+          value % SharedMemorySizeGranularityKib != 0) {
         std::fprintf(stderr, "invalid --shared-kib-per-block value\n");
         return ParseResult::Error;
       }
