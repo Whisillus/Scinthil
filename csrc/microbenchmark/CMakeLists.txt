@@ -1,0 +1,10 @@
+scinthil_add_cuda_executable(
+  scinthil_microbenchmark
+  scinthil_microbenchmark.cu
+  args.cuh
+  bandwidth_global_memory_read.cuh
+  bandwidth_global_memory_read_write.cuh
+  bandwidth_global_memory_write.cuh
+  bandwidth_microbenchmark.cuh
+  bandwidth_utils.cuh
+  utils.cuh)
