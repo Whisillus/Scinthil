@@ -1,21 +1,21 @@
 import argparse
 
-import cutlass
+import cutlass.cute as cute
 import torch
 
-from scinthil.grouped_gemm.sm120 import m_grouped_masked_gemm_torch_sm120
+from scinthil.grouped_gemm.sm120 import m_grouped_masked_gemm_fp8_torch_sm120
 from scinthil.testing import (
     bench_cute_kernel,
-    get_m_grouped_gemm_masked_metrics,
+    get_m_grouped_gemm_masked_fp8_metrics,
     get_m_grouped_masked_gemm_deepgemm_case,
     make_torch_tensor,
+    quantize_fp8,
 )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark SM120 M-grouped masked GEMM")
+    parser = argparse.ArgumentParser(description="Benchmark SM120 FP8 M-grouped masked GEMM")
     parser.add_argument("--case-index", type=int)
-    parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="bfloat16")
     parser.add_argument("--block-swizzle-factor", type=int, default=8)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--warmup-iterations", type=int, default=10)
@@ -36,42 +36,41 @@ def benchmark_case(
     k: int,
 ) -> None:
     valid_m = groups * m
-    dtype = torch.float16 if args.dtype == "float16" else torch.bfloat16
-    cutlass_dtype = cutlass.Float16 if args.dtype == "float16" else cutlass.BFloat16
-    load_bytes, store_bytes, flops = get_m_grouped_gemm_masked_metrics(
+    load_bytes, store_bytes, flops = get_m_grouped_gemm_masked_fp8_metrics(
         groups=groups,
         max_m=max_m,
         m=m,
         n=n,
         k=k,
-        dtype=cutlass_dtype,
     )
-    init_op = {
-        "empty": torch.empty,
-        "zeros": torch.zeros,
-        "rand": torch.rand,
-    }[args.init]
     torch.manual_seed(args.seed)
 
     with torch.cuda.device(device):
-        a = make_torch_tensor(
-            (groups, max_m, k),
-            dtype=dtype,
-            device=device,
-            init_op=init_op,
-        )
-        b = make_torch_tensor(
-            (groups, n, k),
-            dtype=dtype,
-            device=device,
-            init_op=init_op,
-        )
-        token_info = torch.full((groups,), m, dtype=torch.int32, device=device)
-        out = torch.empty((groups, max_m, n), dtype=dtype, device=device)
+        a_shape = (groups, max_m, k)
+        scale_a_shape = (groups, max_m, k // 128)
+        b_shape = (groups, n, k)
+        scale_b_shape = (groups, cute.ceil_div(n, 128), k // 128)
+        if args.init == "empty":
+            a = torch.empty(a_shape, dtype=torch.float8_e4m3fn, device=device)
+            scale_a = torch.ones(scale_a_shape, dtype=torch.float32, device=device)
+            b = torch.empty(b_shape, dtype=torch.float8_e4m3fn, device=device)
+            scale_b = torch.ones(scale_b_shape, dtype=torch.float32, device=device)
+        else:
+            init_op = torch.rand if args.init == "rand" else torch.zeros
+            source_a = make_torch_tensor(a_shape, dtype=torch.bfloat16, device=device, init_op=init_op)
+            source_b = make_torch_tensor(b_shape, dtype=torch.bfloat16, device=device, init_op=init_op)
+            a, scale_a = quantize_fp8(source_a, (1, 1, 128))
+            b, scale_b = quantize_fp8(source_b, (1, 128, 128))
+            del source_a, source_b
 
-        result = m_grouped_masked_gemm_torch_sm120(
+        token_info = torch.full((groups,), m, dtype=torch.int32, device=device)
+        out = torch.empty((groups, max_m, n), dtype=torch.bfloat16, device=device)
+
+        result = m_grouped_masked_gemm_fp8_torch_sm120(
             a,
+            scale_a,
             b,
+            scale_b,
             token_info,
             out=out,
             block_swizzle_factor=args.block_swizzle_factor,
@@ -79,9 +78,11 @@ def benchmark_case(
         torch.cuda.synchronize(device)
 
         def run_grouped_gemm() -> torch.Tensor:
-            return m_grouped_masked_gemm_torch_sm120(
+            return m_grouped_masked_gemm_fp8_torch_sm120(
                 a,
+                scale_a,
                 b,
+                scale_b,
                 token_info,
                 out=out,
                 block_swizzle_factor=args.block_swizzle_factor,
@@ -99,9 +100,9 @@ def benchmark_case(
     matmul_tflops = flops / (avg_time_us * 1.0e6)
 
     print(
-        "SM120 M-grouped masked GEMM benchmark: "
-        f"case={case_index}, dtype={args.dtype}, init={args.init}, G={groups}, Mmax={max_m}, "
-        f"M={m}, N={n}, K={k}, valid_M={valid_m}, block_swizzle_factor={args.block_swizzle_factor}"
+        "SM120 FP8 M-grouped masked GEMM benchmark: "
+        f"case={case_index}, init={args.init}, G={groups}, Mmax={max_m}, M={m}, N={n}, K={k}, "
+        f"valid_M={valid_m}, block_swizzle_factor={args.block_swizzle_factor}"
     )
     print(
         f"device={torch.cuda.get_device_name(device)}, warmup={args.warmup_iterations}, "
@@ -123,7 +124,7 @@ def main() -> int:
     if args.iterations <= 0:
         raise ValueError("iterations must be positive")
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required to benchmark SM120 grouped GEMM")
+        raise RuntimeError("CUDA is required to benchmark SM120 FP8 grouped GEMM")
     if args.device >= torch.cuda.device_count():
         raise ValueError(f"CUDA device {args.device} is not available")
 

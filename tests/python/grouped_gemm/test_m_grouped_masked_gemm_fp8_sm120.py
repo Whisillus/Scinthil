@@ -4,41 +4,19 @@ import pytest
 import torch
 
 from scinthil.grouped_gemm.sm120 import m_grouped_masked_gemm_fp8_torch_sm120
-from scinthil.testing import dequantize_fp8, m_grouped_masked_gemm_ref, quantize_fp8
+from scinthil.testing import (
+    dequantize_fp8,
+    get_m_grouped_masked_gemm_deepgemm_case,
+    m_grouped_masked_gemm_ref,
+    quantize_fp8,
+)
 
 pytestmark = [pytest.mark.gpu, pytest.mark.sm120]
 
 
-def get_m_grouped_masked_gemm_fp8_cases() -> (
-    tuple[
-        tuple[int, int, int, int, int],
-        ...,
-    ]
-):
-    # Mirrors DeepGEMM tests/generators.py::enumerate_m_grouped_masked.
-    return (
-        (32, 4096, 192, 6144, 7168),
-        (32, 4096, 192, 7168, 3072),
-        (32, 4096, 192, 4096, 4096),
-        (32, 4096, 192, 4096, 2048),
-        (6, 4096, 1024, 6144, 7168),
-        (6, 4096, 1024, 7168, 3072),
-        (6, 4096, 1024, 4096, 4096),
-        (6, 4096, 1024, 4096, 2048),
-        (32, 4096, 20, 6144, 7168),
-        (32, 4096, 20, 7168, 3072),
-        (32, 4096, 20, 4096, 4096),
-        (32, 4096, 20, 4096, 2048),
-        (6, 4096, 20, 6144, 7168),
-        (6, 4096, 20, 7168, 3072),
-        (6, 4096, 20, 4096, 4096),
-        (6, 4096, 20, 4096, 2048),
-    )
-
-
 @pytest.mark.parametrize(
     ("groups", "max_m", "expected_m_per_group", "n", "k"),
-    get_m_grouped_masked_gemm_fp8_cases(),
+    get_m_grouped_masked_gemm_deepgemm_case(),
 )
 def test_m_grouped_masked_gemm_fp8_sm120(
     groups: int,
