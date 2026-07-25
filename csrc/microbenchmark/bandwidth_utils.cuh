@@ -12,14 +12,17 @@ namespace scinthil::microbenchmark {
 
 inline void print_bandwidth_benchmark_result(const char* name, const RunMicrobenchmarkOptions& options,
                                              const cudaDeviceProp& properties, std::size_t workspace_count,
-                                             float elapsed_ms, double traffic_multiplier) {
+                                             unsigned int block_count, unsigned int threads_per_block,
+                                             std::size_t index_bits, float elapsed_ms, double traffic_multiplier) {
   const double total_bytes =
       traffic_multiplier * static_cast<double>(options.global_mib_per_buffer * Byte2MByte) * options.repeats;
   const double bandwidth_gb_s = total_bytes / (static_cast<double>(elapsed_ms) / 1000.0) / 1.0e9;
   std::printf(
-      "%s: device=%d (%s), buffer=%zu MiB, workspaces=%zu, traffic=%.0fx, repeats=%d, average=%.3f ms, %.2f GB/s\n",
-      name, options.device, properties.name, options.global_mib_per_buffer, workspace_count, traffic_multiplier,
-      options.repeats, elapsed_ms / options.repeats, bandwidth_gb_s);
+      "%s: device=%d (%s), buffer=%zu MiB, workspaces=%zu, blocks=%u, threads/block=%u, index=%zu-bit, "
+      "accesses/thread-iteration=%u, traffic=%.0fx, repeats=%d, average=%.3f ms, %.2f GB/s\n",
+      name, options.device, properties.name, options.global_mib_per_buffer, workspace_count, block_count,
+      threads_per_block, index_bits, GlobalMemoryAccessesPerThreadIteration, traffic_multiplier, options.repeats,
+      elapsed_ms / options.repeats, bandwidth_gb_s);
 }
 
 struct BandwidthResources {
@@ -102,6 +105,32 @@ struct BandwidthResources {
     return success;
   }
 };
+
+template <typename Kernel>
+[[nodiscard]] bool prepare_global_memory_launch(Kernel kernel, std::size_t element_count,
+                                                const cudaDeviceProp& properties, dim3& threads, dim3& blocks) {
+  threads = dim3{256U, 1U, 1U};
+  int active_blocks_per_multiprocessor{0};
+  if (!SCINTHIL_CUDA_CHECK(
+          cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_multiprocessor, kernel, threads.x, 0))) {
+    return false;
+  }
+
+  const std::size_t elements_per_block_iteration =
+      static_cast<std::size_t>(GlobalMemoryAccessesPerThreadIteration) * threads.x;
+  assert(element_count % elements_per_block_iteration == 0);
+  const std::size_t size_limited_block_count = element_count / elements_per_block_iteration;
+  const std::size_t occupancy_block_count =
+      static_cast<std::size_t>(active_blocks_per_multiprocessor) * properties.multiProcessorCount;
+  std::size_t block_count =
+      size_limited_block_count < occupancy_block_count ? size_limited_block_count : occupancy_block_count;
+  while (element_count % (elements_per_block_iteration * block_count) != 0) {
+    --block_count;
+  }
+  assert(element_count % (elements_per_block_iteration * block_count) == 0);
+  blocks = dim3{static_cast<unsigned int>(block_count), 1U, 1U};
+  return true;
+}
 
 template <typename Kernel>
 [[nodiscard]] bool prepare_shared_memory_launch(Kernel kernel, const RunMicrobenchmarkOptions& options,

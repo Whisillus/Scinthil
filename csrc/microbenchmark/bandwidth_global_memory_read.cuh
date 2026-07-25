@@ -3,20 +3,63 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
-#include <cstdio>
+#include <limits>
 
 #include "bandwidth_utils.cuh"
 #include "ptx.cuh"
 
 namespace scinthil::microbenchmark {
 
-template <typename T>
-__global__ void bandwidth_global_memory_read_kernel(const T* input, std::size_t element_count) {
-  const std::size_t thread_index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const std::size_t thread_count = static_cast<std::size_t>(gridDim.x) * blockDim.x;
-  for (std::size_t index = thread_index; index < element_count; index += thread_count) {
+template <typename T, typename Index>
+__global__ void bandwidth_global_memory_read_kernel(const T* input, Index iteration_count) {
+  const Index thread_index = static_cast<Index>(blockIdx.x) * static_cast<Index>(blockDim.x) + threadIdx.x;
+  const Index thread_count = static_cast<Index>(gridDim.x) * static_cast<Index>(blockDim.x);
+  const Index iteration_stride = static_cast<Index>(GlobalMemoryAccessesPerThreadIteration) * thread_count;
+
+#pragma unroll 1
+  for (Index iteration{0}; iteration < iteration_count; ++iteration) {
+    const Index index = iteration * iteration_stride + thread_index;
     ptx::ldg_128bit_discard_result(input + index);
+    ptx::ldg_128bit_discard_result(input + index + thread_count);
+    ptx::ldg_128bit_discard_result(input + index + 2U * thread_count);
+    ptx::ldg_128bit_discard_result(input + index + 3U * thread_count);
   }
+}
+
+template <typename T, typename Index>
+[[nodiscard]] bool run_bandwidth_global_memory_read_impl(const RunMicrobenchmarkOptions& options,
+                                                         const cudaDeviceProp& properties,
+                                                         BandwidthResources& resources, Index element_count) {
+  auto* input = static_cast<T*>(resources.input);
+
+  dim3 threads{};
+  dim3 blocks{};
+  if (!prepare_global_memory_launch(bandwidth_global_memory_read_kernel<T, Index>,
+                                    static_cast<std::size_t>(element_count), properties, threads, blocks)) {
+    return false;
+  }
+  const std::size_t element_count_size = static_cast<std::size_t>(element_count);
+  const std::size_t grid_thread_count = static_cast<std::size_t>(blocks.x) * threads.x;
+  const std::size_t iteration_stride = GlobalMemoryAccessesPerThreadIteration * grid_thread_count;
+  assert(element_count_size % iteration_stride == 0);
+  const Index iteration_count = static_cast<Index>(element_count_size / iteration_stride);
+
+  float elapsed_ms{0.0F};
+  if (!measure(
+          options, resources,
+          [=, &resources](std::size_t launch_index) {
+            const std::size_t workspace_index = launch_index % resources.workspace_count;
+            bandwidth_global_memory_read_kernel<T, Index><<<blocks, threads, 0, resources.stream>>>(
+                input + workspace_index * element_count_size, iteration_count);
+            return SCINTHIL_CUDA_CHECK(cudaGetLastError());
+          },
+          elapsed_ms)) {
+    return false;
+  }
+
+  print_bandwidth_benchmark_result("global-memory read-only", options, properties, resources.workspace_count, blocks.x,
+                                   threads.x, sizeof(Index) * 8U, elapsed_ms, 1.0);
+  return true;
 }
 
 [[nodiscard]] inline bool run_bandwidth_global_memory_read(const RunMicrobenchmarkOptions& options,
@@ -25,39 +68,11 @@ __global__ void bandwidth_global_memory_read_kernel(const T* input, std::size_t 
   using T = uint4;
   const std::size_t bytes = options.global_mib_per_buffer * Byte2MByte;
   const std::size_t element_count = bytes / sizeof(T);
-  auto* input = static_cast<T*>(resources.input);
-
-  int minimum_grid_size{0};
-  int num_threads_x{0};
-  if (!SCINTHIL_CUDA_CHECK(cudaOccupancyMaxPotentialBlockSize(&minimum_grid_size, &num_threads_x,
-                                                              bandwidth_global_memory_read_kernel<T>, 0, 0))) {
-    return false;
+  if (element_count <= std::numeric_limits<unsigned int>::max()) {
+    return run_bandwidth_global_memory_read_impl<T, unsigned int>(options, properties, resources,
+                                                                  static_cast<unsigned int>(element_count));
   }
-  const dim3 threads{static_cast<unsigned int>(num_threads_x), 1, 1};
-  const std::size_t num_blocks_x =
-      (element_count + static_cast<std::size_t>(threads.x) - 1) / static_cast<std::size_t>(threads.x);
-  if (num_blocks_x > static_cast<std::size_t>(properties.maxGridSize[0])) {
-    std::fprintf(stderr, "global-memory read grid exceeds the device limit\n");
-    return false;
-  }
-  const dim3 blocks{static_cast<unsigned int>(num_blocks_x), 1, 1};
-
-  float elapsed_ms{0.0F};
-  if (!measure(
-          options, resources,
-          [=, &resources](std::size_t launch_index) {
-            const std::size_t workspace_index = launch_index % resources.workspace_count;
-            bandwidth_global_memory_read_kernel<T>
-                <<<blocks, threads, 0, resources.stream>>>(input + workspace_index * element_count, element_count);
-            return SCINTHIL_CUDA_CHECK(cudaGetLastError());
-          },
-          elapsed_ms)) {
-    return false;
-  }
-
-  print_bandwidth_benchmark_result("global-memory read-only", options, properties, resources.workspace_count,
-                                   elapsed_ms, 1.0);
-  return true;
+  return run_bandwidth_global_memory_read_impl<T, std::size_t>(options, properties, resources, element_count);
 }
 
 }  // namespace scinthil::microbenchmark

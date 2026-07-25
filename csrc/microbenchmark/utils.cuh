@@ -13,6 +13,7 @@ inline constexpr std::size_t Byte2KByte{1024U};
 inline constexpr std::size_t Byte2MByte{1024U * 1024U};
 inline constexpr std::size_t L1CacheMinimumSizeKib{4U};
 inline constexpr std::size_t SharedMemorySizeGranularityKib{16U};
+inline constexpr unsigned int GlobalMemoryAccessesPerThreadIteration{4U};
 inline constexpr int SharedMemoryPassesPerLaunchGranularity{4};
 
 struct RunMicrobenchmarkOptions {
