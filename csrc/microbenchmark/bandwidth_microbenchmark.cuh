@@ -40,15 +40,15 @@ struct BandwidthResourceRequirements {
   return {};
 }
 
-[[nodiscard]] inline bool initialize_bandwidth_resources(const Arguments& arguments, BandwidthResources* resources,
-                                                         cudaDeviceProp* properties) {
+[[nodiscard]] inline bool initialize_bandwidth_resources(const Arguments& arguments, BandwidthResources& resources,
+                                                         cudaDeviceProp& properties) {
   const BandwidthResourceRequirements requirements = get_bandwidth_resource_requirements(arguments.benchmark);
-  return resources->initialize_resources(arguments.options, requirements.needs_input, requirements.needs_output,
-                                         properties);
+  return resources.initialize_resources(arguments.options, requirements.needs_input, requirements.needs_output,
+                                        properties);
 }
 
 [[nodiscard]] inline bool run_selected_bandwidth_benchmark(const Arguments& arguments, const cudaDeviceProp& properties,
-                                                           BandwidthResources* resources) {
+                                                           BandwidthResources& resources) {
   switch (arguments.benchmark) {
     case Benchmark::GlobalMemoryRead:
       return run_bandwidth_global_memory_read(arguments.options, properties, resources);
@@ -74,8 +74,8 @@ struct BandwidthResourceRequirements {
 [[nodiscard]] inline bool run_bandwidth_microbenchmark(const Arguments& arguments) {
   BandwidthResources resources{};
   cudaDeviceProp properties{};
-  const bool initialize_success = initialize_bandwidth_resources(arguments, &resources, &properties);
-  const bool run_success = initialize_success && run_selected_bandwidth_benchmark(arguments, properties, &resources);
+  const bool initialize_success = initialize_bandwidth_resources(arguments, resources, properties);
+  const bool run_success = initialize_success && run_selected_bandwidth_benchmark(arguments, properties, resources);
   const bool cleanup_success = resources.release_resources();
   return run_success && cleanup_success;
 }

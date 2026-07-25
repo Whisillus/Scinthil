@@ -21,11 +21,11 @@ __global__ void bandwidth_global_memory_write_kernel(T* output, std::size_t elem
 
 [[nodiscard]] inline bool run_bandwidth_global_memory_write(const RunMicrobenchmarkOptions& options,
                                                             const cudaDeviceProp& properties,
-                                                            BandwidthResources* resources) {
+                                                            BandwidthResources& resources) {
   using T = uint4;
-  const std::size_t bytes = options.size_mib * Byte2MByte;
+  const std::size_t bytes = options.global_mib_per_buffer * Byte2MByte;
   const std::size_t element_count = bytes / sizeof(T);
-  auto* output = static_cast<T*>(resources->output);
+  auto* output = static_cast<T*>(resources.output);
   const T value = make_uint4(0x12345678U, 0x9abcdef0U, 0x55aa55aaU, 0xa55aa55aU);
 
   int minimum_grid_size{0};
@@ -46,17 +46,17 @@ __global__ void bandwidth_global_memory_write_kernel(T* output, std::size_t elem
   float elapsed_ms{0.0F};
   if (!measure(
           options, resources,
-          [=](std::size_t launch_index) {
-            const std::size_t workspace_index = launch_index % resources->workspace_count;
-            bandwidth_global_memory_write_kernel<T><<<blocks, threads, 0, resources->stream>>>(
+          [=, &resources](std::size_t launch_index) {
+            const std::size_t workspace_index = launch_index % resources.workspace_count;
+            bandwidth_global_memory_write_kernel<T><<<blocks, threads, 0, resources.stream>>>(
                 output + workspace_index * element_count, element_count, value);
             return SCINTHIL_CUDA_CHECK(cudaGetLastError());
           },
-          &elapsed_ms)) {
+          elapsed_ms)) {
     return false;
   }
 
-  print_bandwidth_benchmark_result("global-memory write-only", options, properties, resources->workspace_count,
+  print_bandwidth_benchmark_result("global-memory write-only", options, properties, resources.workspace_count,
                                    elapsed_ms, 1.0);
   return true;
 }

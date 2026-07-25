@@ -22,12 +22,12 @@ __global__ void bandwidth_global_memory_read_write_kernel(const T* input, T* out
 
 [[nodiscard]] inline bool run_bandwidth_global_memory_read_write(const RunMicrobenchmarkOptions& options,
                                                                  const cudaDeviceProp& properties,
-                                                                 BandwidthResources* resources) {
+                                                                 BandwidthResources& resources) {
   using T = uint4;
-  const std::size_t bytes = options.size_mib * Byte2MByte;
+  const std::size_t bytes = options.global_mib_per_buffer * Byte2MByte;
   const std::size_t element_count = bytes / sizeof(T);
-  auto* input = static_cast<T*>(resources->input);
-  auto* output = static_cast<T*>(resources->output);
+  auto* input = static_cast<T*>(resources.input);
+  auto* output = static_cast<T*>(resources.output);
 
   int minimum_grid_size{0};
   int num_threads_x{0};
@@ -47,17 +47,17 @@ __global__ void bandwidth_global_memory_read_write_kernel(const T* input, T* out
   float elapsed_ms{0.0F};
   if (!measure(
           options, resources,
-          [=](std::size_t launch_index) {
-            const std::size_t workspace_index = launch_index % resources->workspace_count;
-            bandwidth_global_memory_read_write_kernel<T><<<blocks, threads, 0, resources->stream>>>(
+          [=, &resources](std::size_t launch_index) {
+            const std::size_t workspace_index = launch_index % resources.workspace_count;
+            bandwidth_global_memory_read_write_kernel<T><<<blocks, threads, 0, resources.stream>>>(
                 input + workspace_index * element_count, output + workspace_index * element_count, element_count);
             return SCINTHIL_CUDA_CHECK(cudaGetLastError());
           },
-          &elapsed_ms)) {
+          elapsed_ms)) {
     return false;
   }
 
-  print_bandwidth_benchmark_result("global-memory read+write", options, properties, resources->workspace_count,
+  print_bandwidth_benchmark_result("global-memory read+write", options, properties, resources.workspace_count,
                                    elapsed_ms, 2.0);
   return true;
 }

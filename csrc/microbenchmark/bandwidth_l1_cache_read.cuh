@@ -12,7 +12,8 @@ namespace scinthil::microbenchmark {
 
 template <typename T, unsigned int Unroll>
 __global__ __launch_bounds__(256) void bandwidth_l1_cache_read_kernel(const T* input, T* output,
-                                                                      unsigned int elements_per_block, int sweeps) {
+                                                                      unsigned int elements_per_block,
+                                                                      int passes_per_launch) {
   static_assert(Unroll >= 1U && Unroll <= 4U);
   const T* block_input = input + static_cast<std::size_t>(blockIdx.x) * elements_per_block;
   const unsigned int stride = blockDim.x;
@@ -25,7 +26,7 @@ __global__ __launch_bounds__(256) void bandwidth_l1_cache_read_kernel(const T* i
   }
   __syncthreads();
 
-  for (int sweep{0}; sweep < sweeps; ++sweep) {
+  for (int pass{0}; pass < passes_per_launch; ++pass) {
     for (unsigned int index = threadIdx.x; index < elements_per_block; index += Unroll * stride) {
 #pragma unroll
       for (unsigned int offset{0}; offset < Unroll; ++offset) {
@@ -48,7 +49,7 @@ __global__ __launch_bounds__(256) void bandwidth_l1_cache_read_kernel(const T* i
 
 template <unsigned int Unroll>
 [[nodiscard]] bool run_bandwidth_l1_cache_read_impl(const RunMicrobenchmarkOptions& options,
-                                                    const cudaDeviceProp& properties, BandwidthResources* resources,
+                                                    const cudaDeviceProp& properties, BandwidthResources& resources,
                                                     unsigned int blocks_per_sm, std::size_t bytes_per_block) {
   using T = uint4;
   const dim3 threads{256U, 1U, 1U};
@@ -58,15 +59,15 @@ template <unsigned int Unroll>
   }
   const unsigned int block_count = blocks_per_sm * static_cast<unsigned int>(properties.multiProcessorCount);
   const std::size_t working_set_bytes = bytes_per_block * block_count;
-  if (!resources->allocate_input(working_set_bytes)) {
+  if (!resources.allocate_input(working_set_bytes)) {
     return false;
   }
-  if (!resources->allocate_output(static_cast<std::size_t>(block_count) * threads.x * sizeof(T))) {
+  if (!resources.allocate_output(static_cast<std::size_t>(block_count) * threads.x * sizeof(T))) {
     return false;
   }
 
-  auto* input = static_cast<T*>(resources->input);
-  auto* output = static_cast<T*>(resources->output);
+  auto* input = static_cast<T*>(resources.input);
+  auto* output = static_cast<T*>(resources.output);
   const unsigned int elements_per_block = static_cast<unsigned int>(bytes_per_block / sizeof(T));
   const dim3 blocks{block_count, 1U, 1U};
   assert(elements_per_block % (Unroll * threads.x) == 0);
@@ -74,12 +75,12 @@ template <unsigned int Unroll>
   float elapsed_ms{0.0F};
   if (!measure(
           options, resources,
-          [=](std::size_t) {
-            bandwidth_l1_cache_read_kernel<T, Unroll>
-                <<<blocks, threads, 0, resources->stream>>>(input, output, elements_per_block, options.sweeps);
+          [=, &resources](std::size_t) {
+            bandwidth_l1_cache_read_kernel<T, Unroll><<<blocks, threads, 0, resources.stream>>>(
+                input, output, elements_per_block, options.passes_per_launch);
             return SCINTHIL_CUDA_CHECK(cudaGetLastError());
           },
-          &elapsed_ms)) {
+          elapsed_ms)) {
     return false;
   }
 
@@ -88,10 +89,10 @@ template <unsigned int Unroll>
 }
 
 [[nodiscard]] inline bool run_bandwidth_l1_cache_read(const RunMicrobenchmarkOptions& options,
-                                                      const cudaDeviceProp& properties, BandwidthResources* resources) {
+                                                      const cudaDeviceProp& properties, BandwidthResources& resources) {
   using T = uint4;
   const dim3 threads{256U, 1U, 1U};
-  const std::size_t requested_bytes_per_sm = options.size_kib * Byte2KByte;
+  const std::size_t requested_bytes_per_sm = options.l1_kib_per_sm * Byte2KByte;
   const std::size_t bytes_per_thread_pass = static_cast<std::size_t>(threads.x) * sizeof(T);
 
   int maximum_blocks_per_sm{0};

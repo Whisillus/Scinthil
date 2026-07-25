@@ -6,7 +6,7 @@
 int main(int argc, char** argv) {
   scinthil::microbenchmark::Arguments arguments{};
   const scinthil::microbenchmark::ParseResult parse_result =
-      scinthil::microbenchmark::parse_arguments(argc, argv, &arguments);
+      scinthil::microbenchmark::parse_arguments(argc, argv, arguments);
   if (parse_result == scinthil::microbenchmark::ParseResult::Help) {
     scinthil::microbenchmark::print_usage(argv[0]);
     return EXIT_SUCCESS;
