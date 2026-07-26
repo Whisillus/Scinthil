@@ -13,6 +13,12 @@
 #include "bandwidth_shared_memory_read.cuh"
 #include "bandwidth_shared_memory_read_write.cuh"
 #include "bandwidth_shared_memory_write.cuh"
+#include "bandwidth_tma_bulk_read.cuh"
+#include "bandwidth_tma_bulk_read_write.cuh"
+#include "bandwidth_tma_bulk_write.cuh"
+#include "bandwidth_tma_tensor_read.cuh"
+#include "bandwidth_tma_tensor_read_write.cuh"
+#include "bandwidth_tma_tensor_write.cuh"
 #include "bandwidth_utils.cuh"
 
 namespace scinthil::microbenchmark {
@@ -25,10 +31,13 @@ struct BandwidthResourceRequirements {
 [[nodiscard]] inline BandwidthResourceRequirements get_bandwidth_resource_requirements(Benchmark benchmark) {
   switch (benchmark) {
     case Benchmark::GlobalMemoryRead:
+    case Benchmark::TmaRead:
       return {.needs_input = true, .needs_output = false};
     case Benchmark::GlobalMemoryWrite:
+    case Benchmark::TmaWrite:
       return {.needs_input = false, .needs_output = true};
     case Benchmark::GlobalMemoryReadWrite:
+    case Benchmark::TmaReadWrite:
       return {.needs_input = true, .needs_output = true};
     case Benchmark::L1CacheRead:
     case Benchmark::L2CacheRead:
@@ -66,6 +75,18 @@ struct BandwidthResourceRequirements {
       return run_bandwidth_shared_memory_write(arguments.options, properties, resources);
     case Benchmark::SharedMemoryReadWrite:
       return run_bandwidth_shared_memory_read_write(arguments.options, properties, resources);
+    case Benchmark::TmaRead:
+      return arguments.options.tma_kind == TmaKind::Bulk
+                 ? run_bandwidth_tma_bulk_read(arguments.options, properties, resources)
+                 : run_bandwidth_tma_tensor_read(arguments.options, properties, resources);
+    case Benchmark::TmaWrite:
+      return arguments.options.tma_kind == TmaKind::Bulk
+                 ? run_bandwidth_tma_bulk_write(arguments.options, properties, resources)
+                 : run_bandwidth_tma_tensor_write(arguments.options, properties, resources);
+    case Benchmark::TmaReadWrite:
+      return arguments.options.tma_kind == TmaKind::Bulk
+                 ? run_bandwidth_tma_bulk_read_write(arguments.options, properties, resources)
+                 : run_bandwidth_tma_tensor_read_write(arguments.options, properties, resources);
   }
   std::fprintf(stderr, "invalid bandwidth benchmark selection\n");
   return false;

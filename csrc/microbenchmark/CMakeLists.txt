@@ -11,6 +11,12 @@ scinthil_add_cuda_executable(
   bandwidth_shared_memory_read.cuh
   bandwidth_shared_memory_read_write.cuh
   bandwidth_shared_memory_write.cuh
+  bandwidth_tma_bulk_read.cuh
+  bandwidth_tma_bulk_read_write.cuh
+  bandwidth_tma_bulk_write.cuh
+  bandwidth_tma_tensor_read.cuh
+  bandwidth_tma_tensor_read_write.cuh
+  bandwidth_tma_tensor_write.cuh
   bandwidth_utils.cuh
   ptx.cuh
   utils.cuh)
