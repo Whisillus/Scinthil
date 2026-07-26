@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 
 #include "bandwidth_utils.cuh"
 #include "ptx.cuh"
@@ -50,7 +51,9 @@ __global__ __launch_bounds__(256) void bandwidth_shared_memory_read_write_kernel
   const std::size_t shared_memory_bytes = options.shared_kib_per_block * Byte2KByte;
   const unsigned int element_count = static_cast<unsigned int>(shared_memory_bytes / sizeof(uint4));
 
-  float elapsed_ms{0.0F};
+  const std::uint64_t single_iter_byte =
+      static_cast<std::uint64_t>(shared_memory_bytes) * blocks.x * options.passes_per_launch;
+  BenchmarkResult result{};
   if (!measure(
           options, resources,
           [=, &resources](std::size_t) {
@@ -58,12 +61,11 @@ __global__ __launch_bounds__(256) void bandwidth_shared_memory_read_write_kernel
                 element_count, options.passes_per_launch);
             return SCINTHIL_CUDA_CHECK(cudaGetLastError());
           },
-          elapsed_ms)) {
+          single_iter_byte, single_iter_byte, result)) {
     return false;
   }
 
-  print_shared_memory_bandwidth_benchmark_result("shared-memory read+write", options, properties, blocks.x, elapsed_ms,
-                                                 2.0);
+  print_shared_memory_bandwidth_benchmark_result("shared-memory read+write", options, properties, blocks.x, result);
   return true;
 }
 

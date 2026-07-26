@@ -10,26 +10,48 @@
 
 namespace scinthil::microbenchmark {
 
+[[nodiscard]] inline double calculate_bandwidth_gb_s(std::uint64_t bytes, double latency_us) {
+  return static_cast<double>(bytes) / latency_us / 1.0e3;
+}
+
+inline void print_benchmark_result_statistics(const BenchmarkResult& result) {
+  const std::uint64_t single_iter_aggregate_byte = result.single_iter_read_byte + result.single_iter_write_byte;
+  std::printf(
+      "  iterations=%zu, read/iteration=%llu B, write/iteration=%llu B, total-read=%llu B, total-write=%llu B\n"
+      "  latency-us: total=%.3f, mean=%.3f, median=%.3f, min=%.3f, max=%.3f, stddev=%.3f\n"
+      "  bandwidth-GB/s: mean(read=%.2f, write=%.2f, aggregate=%.2f), "
+      "median(read=%.2f, write=%.2f, aggregate=%.2f), best(read=%.2f, write=%.2f, aggregate=%.2f)\n",
+      result.num_iter, static_cast<unsigned long long>(result.single_iter_read_byte),
+      static_cast<unsigned long long>(result.single_iter_write_byte),
+      static_cast<unsigned long long>(result.total_read_byte), static_cast<unsigned long long>(result.total_write_byte),
+      result.total_latency_us, result.mean_latency_us, result.median_latency_us, result.minimum_latency_us,
+      result.maximum_latency_us, result.standard_deviation_latency_us,
+      calculate_bandwidth_gb_s(result.single_iter_read_byte, result.mean_latency_us),
+      calculate_bandwidth_gb_s(result.single_iter_write_byte, result.mean_latency_us),
+      calculate_bandwidth_gb_s(single_iter_aggregate_byte, result.mean_latency_us),
+      calculate_bandwidth_gb_s(result.single_iter_read_byte, result.median_latency_us),
+      calculate_bandwidth_gb_s(result.single_iter_write_byte, result.median_latency_us),
+      calculate_bandwidth_gb_s(single_iter_aggregate_byte, result.median_latency_us),
+      calculate_bandwidth_gb_s(result.single_iter_read_byte, result.minimum_latency_us),
+      calculate_bandwidth_gb_s(result.single_iter_write_byte, result.minimum_latency_us),
+      calculate_bandwidth_gb_s(single_iter_aggregate_byte, result.minimum_latency_us));
+}
+
 inline void print_bandwidth_benchmark_result(const char* name, const RunMicrobenchmarkOptions& options,
                                              const cudaDeviceProp& properties, std::size_t workspace_count,
                                              unsigned int block_count, unsigned int threads_per_block,
-                                             std::size_t index_bits, float elapsed_ms, double traffic_multiplier) {
-  const double total_bytes =
-      traffic_multiplier * static_cast<double>(options.global_mib_per_buffer * Byte2MByte) * options.repeats;
-  const double bandwidth_gb_s = total_bytes / (static_cast<double>(elapsed_ms) / 1000.0) / 1.0e9;
+                                             std::size_t index_bits, const BenchmarkResult& result) {
   std::printf(
       "%s: device=%d (%s), buffer=%zu MiB, workspaces=%zu, blocks=%u, threads/block=%u, index=%zu-bit, "
-      "accesses/thread-iteration=%u, traffic=%.0fx, repeats=%d, average=%.3f ms, %.2f GB/s\n",
+      "accesses/thread-iteration=%u\n",
       name, options.device, properties.name, options.global_mib_per_buffer, workspace_count, block_count,
-      threads_per_block, index_bits, GlobalMemoryAccessesPerThreadIteration, traffic_multiplier, options.repeats,
-      elapsed_ms / options.repeats, bandwidth_gb_s);
+      threads_per_block, index_bits, GlobalMemoryAccessesPerThreadIteration);
+  print_benchmark_result_statistics(result);
 }
 
 struct BandwidthResources {
   void* input{nullptr};
   void* output{nullptr};
-  cudaEvent_t start{nullptr};
-  cudaEvent_t stop{nullptr};
   cudaStream_t stream{nullptr};
   std::size_t workspace_count{1};
 
@@ -62,12 +84,6 @@ struct BandwidthResources {
     if (!SCINTHIL_CUDA_CHECK(cudaStreamCreate(&stream))) {
       return false;
     }
-    if (!SCINTHIL_CUDA_CHECK(cudaEventCreate(&start))) {
-      return false;
-    }
-    if (!SCINTHIL_CUDA_CHECK(cudaEventCreate(&stop))) {
-      return false;
-    }
     if (needs_input) {
       if (!allocate_input(allocation_bytes)) {
         return false;
@@ -92,12 +108,6 @@ struct BandwidthResources {
     }
     if (output != nullptr) {
       success = SCINTHIL_CUDA_CHECK(cudaFree(output)) && success;
-    }
-    if (start != nullptr) {
-      success = SCINTHIL_CUDA_CHECK(cudaEventDestroy(start)) && success;
-    }
-    if (stop != nullptr) {
-      success = SCINTHIL_CUDA_CHECK(cudaEventDestroy(stop)) && success;
     }
     if (stream != nullptr) {
       success = SCINTHIL_CUDA_CHECK(cudaStreamDestroy(stream)) && success;
@@ -169,59 +179,42 @@ template <typename Kernel>
 
 inline void print_tma_bandwidth_benchmark_result(const char* name, const RunMicrobenchmarkOptions& options,
                                                  const cudaDeviceProp& properties, std::size_t workspace_count,
-                                                 unsigned int stage_count, float elapsed_ms,
-                                                 double global_traffic_multiplier) {
-  const double payload_bytes = static_cast<double>(options.global_mib_per_buffer * Byte2MByte) * options.repeats;
-  const double seconds = static_cast<double>(elapsed_ms) / 1000.0;
-  const double payload_gb_s = payload_bytes / seconds / 1.0e9;
-  const double aggregate_global_gb_s = global_traffic_multiplier * payload_gb_s;
+                                                 unsigned int stage_count, const BenchmarkResult& result) {
   std::printf(
       "%s: device=%d (%s), buffer=%zu MiB, workspaces=%zu, transfer=%zu KiB, benchmark-stages=%u, blocks=%u, "
-      "threads/block=%u, global-traffic=%.0fx, repeats=%d, average=%.3f ms, payload=%.2f GB/s, "
-      "aggregate-global=%.2f GB/s\n",
+      "threads/block=%u\n",
       name, options.device, properties.name, options.global_mib_per_buffer, workspace_count,
-      options.shared_kib_per_block, stage_count, properties.multiProcessorCount, 32U, global_traffic_multiplier,
-      options.repeats, elapsed_ms / options.repeats, payload_gb_s, aggregate_global_gb_s);
+      options.shared_kib_per_block, stage_count, properties.multiProcessorCount, 32U);
+  print_benchmark_result_statistics(result);
 }
 
 inline void print_shared_memory_bandwidth_benchmark_result(const char* name, const RunMicrobenchmarkOptions& options,
                                                            const cudaDeviceProp& properties, unsigned int block_count,
-                                                           float elapsed_ms, double traffic_multiplier) {
-  const double total_bytes = traffic_multiplier * static_cast<double>(options.shared_kib_per_block * Byte2KByte) *
-                             block_count * options.passes_per_launch * options.repeats;
-  const double bandwidth_gb_s = total_bytes / (static_cast<double>(elapsed_ms) / 1000.0) / 1.0e9;
-  std::printf(
-      "%s: device=%d (%s), shared=%zu KiB/block, blocks=%u, passes/launch=%d, traffic=%.0fx, repeats=%d, "
-      "average=%.3f ms, %.2f GB/s\n",
-      name, options.device, properties.name, options.shared_kib_per_block, block_count, options.passes_per_launch,
-      traffic_multiplier, options.repeats, elapsed_ms / options.repeats, bandwidth_gb_s);
+                                                           const BenchmarkResult& result) {
+  std::printf("%s: device=%d (%s), shared=%zu KiB/block, blocks=%u, passes/launch=%d\n", name, options.device,
+              properties.name, options.shared_kib_per_block, block_count, options.passes_per_launch);
+  print_benchmark_result_statistics(result);
 }
 
 inline void print_l1_cache_bandwidth_benchmark_result(const RunMicrobenchmarkOptions& options,
                                                       const cudaDeviceProp& properties, unsigned int blocks_per_sm,
-                                                      std::size_t bytes_per_block, float elapsed_ms) {
+                                                      std::size_t bytes_per_block, const BenchmarkResult& result) {
   const std::size_t bytes_per_sm = bytes_per_block * blocks_per_sm;
-  const std::size_t working_set_bytes = bytes_per_sm * static_cast<std::size_t>(properties.multiProcessorCount);
-  const double total_bytes = static_cast<double>(working_set_bytes) * options.passes_per_launch * options.repeats;
-  const double bandwidth_gb_s = total_bytes / (static_cast<double>(elapsed_ms) / 1000.0) / 1.0e9;
   std::printf(
       "L1 cache read-only: device=%d (%s), working-set=%.2f KiB/SM, slice=%.2f KiB/block, blocks/SM=%u, "
-      "passes/launch=%d, repeats=%d, average=%.3f ms, %.2f GB/s\n",
+      "passes/launch=%d\n",
       options.device, properties.name, static_cast<double>(bytes_per_sm) / Byte2KByte,
-      static_cast<double>(bytes_per_block) / Byte2KByte, blocks_per_sm, options.passes_per_launch, options.repeats,
-      elapsed_ms / options.repeats, bandwidth_gb_s);
+      static_cast<double>(bytes_per_block) / Byte2KByte, blocks_per_sm, options.passes_per_launch);
+  print_benchmark_result_statistics(result);
 }
 
 inline void print_l2_cache_bandwidth_benchmark_result(const RunMicrobenchmarkOptions& options,
                                                       const cudaDeviceProp& properties, std::size_t working_set_bytes,
-                                                      unsigned int block_count, float elapsed_ms) {
-  const double total_bytes = static_cast<double>(working_set_bytes) * options.passes_per_launch * options.repeats;
-  const double bandwidth_gb_s = total_bytes / (static_cast<double>(elapsed_ms) / 1000.0) / 1.0e9;
-  std::printf(
-      "L2 cache read-only: device=%d (%s), working-set=%.2f MiB, blocks=%u, passes/launch=%d, repeats=%d, "
-      "average=%.3f ms, %.2f GB/s\n",
-      options.device, properties.name, static_cast<double>(working_set_bytes) / Byte2MByte, block_count,
-      options.passes_per_launch, options.repeats, elapsed_ms / options.repeats, bandwidth_gb_s);
+                                                      unsigned int block_count, const BenchmarkResult& result) {
+  std::printf("L2 cache read-only: device=%d (%s), working-set=%.2f MiB, blocks=%u, passes/launch=%d\n", options.device,
+              properties.name, static_cast<double>(working_set_bytes) / Byte2MByte, block_count,
+              options.passes_per_launch);
+  print_benchmark_result_statistics(result);
 }
 
 }  // namespace scinthil::microbenchmark

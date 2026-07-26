@@ -95,7 +95,7 @@ template <unsigned int Stages>
   const dim3 threads{32U, 1U, 1U};
   auto* input = static_cast<unsigned char*>(resources.input);
   auto* output = static_cast<unsigned char*>(resources.output);
-  float elapsed_ms{0.0F};
+  BenchmarkResult result{};
   if (!measure(
           options, resources,
           [=, &resources](std::size_t launch_index) {
@@ -105,12 +105,12 @@ template <unsigned int Stages>
                 static_cast<unsigned int>(transfer_bytes));
             return SCINTHIL_CUDA_CHECK(cudaGetLastError());
           },
-          elapsed_ms)) {
+          buffer_bytes, buffer_bytes, result)) {
     return false;
   }
 
   print_tma_bandwidth_benchmark_result("TMA bulk read+write", options, properties, resources.workspace_count, Stages,
-                                       elapsed_ms, 2.0);
+                                       result);
   return true;
 }
 

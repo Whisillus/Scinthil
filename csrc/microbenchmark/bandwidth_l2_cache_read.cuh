@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 
 #include "bandwidth_utils.cuh"
@@ -78,7 +79,8 @@ __global__ __launch_bounds__(256) void bandwidth_l2_cache_read_kernel(const T* i
   const dim3 blocks{block_count, 1U, 1U};
   assert(element_count % (4U * block_count * threads.x) == 0);
 
-  float elapsed_ms{0.0F};
+  const std::uint64_t single_iter_read_byte = static_cast<std::uint64_t>(working_set_bytes) * options.passes_per_launch;
+  BenchmarkResult result{};
   if (!measure(
           options, resources,
           [=, &resources](std::size_t) {
@@ -86,11 +88,11 @@ __global__ __launch_bounds__(256) void bandwidth_l2_cache_read_kernel(const T* i
                 <<<blocks, threads, 0, resources.stream>>>(input, output, element_count, options.passes_per_launch);
             return SCINTHIL_CUDA_CHECK(cudaGetLastError());
           },
-          elapsed_ms)) {
+          single_iter_read_byte, 0U, result)) {
     return false;
   }
 
-  print_l2_cache_bandwidth_benchmark_result(options, properties, working_set_bytes, block_count, elapsed_ms);
+  print_l2_cache_bandwidth_benchmark_result(options, properties, working_set_bytes, block_count, result);
   return true;
 }
 

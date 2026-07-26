@@ -4,6 +4,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 
 #include "bandwidth_utils.cuh"
 #include "ptx.cuh"
@@ -71,7 +72,8 @@ template <unsigned int Unroll>
   const dim3 blocks{block_count, 1U, 1U};
   assert(elements_per_block % (Unroll * threads.x) == 0);
 
-  float elapsed_ms{0.0F};
+  const std::uint64_t single_iter_read_byte = static_cast<std::uint64_t>(working_set_bytes) * options.passes_per_launch;
+  BenchmarkResult result{};
   if (!measure(
           options, resources,
           [=, &resources](std::size_t) {
@@ -79,11 +81,11 @@ template <unsigned int Unroll>
                 input, output, elements_per_block, options.passes_per_launch);
             return SCINTHIL_CUDA_CHECK(cudaGetLastError());
           },
-          elapsed_ms)) {
+          single_iter_read_byte, 0U, result)) {
     return false;
   }
 
-  print_l1_cache_bandwidth_benchmark_result(options, properties, blocks_per_sm, bytes_per_block, elapsed_ms);
+  print_l1_cache_bandwidth_benchmark_result(options, properties, blocks_per_sm, bytes_per_block, result);
   return true;
 }
 

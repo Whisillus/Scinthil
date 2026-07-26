@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 
 #include "bandwidth_utils.cuh"
@@ -45,7 +46,8 @@ template <typename T, typename Index>
   assert(element_count_size % iteration_stride == 0);
   const Index iteration_count = static_cast<Index>(element_count_size / iteration_stride);
 
-  float elapsed_ms{0.0F};
+  const std::uint64_t single_iter_write_byte = element_count_size * sizeof(T);
+  BenchmarkResult result{};
   if (!measure(
           options, resources,
           [=, &resources](std::size_t launch_index) {
@@ -54,12 +56,12 @@ template <typename T, typename Index>
                 output + workspace_index * element_count_size, value, iteration_count);
             return SCINTHIL_CUDA_CHECK(cudaGetLastError());
           },
-          elapsed_ms)) {
+          0U, single_iter_write_byte, result)) {
     return false;
   }
 
   print_bandwidth_benchmark_result("global-memory write-only", options, properties, resources.workspace_count, blocks.x,
-                                   threads.x, sizeof(Index) * 8U, elapsed_ms, 1.0);
+                                   threads.x, sizeof(Index) * 8U, result);
   return true;
 }
 

@@ -63,7 +63,7 @@ template <unsigned int Stages>
 
   const dim3 blocks{static_cast<unsigned int>(properties.multiProcessorCount), 1U, 1U};
   const dim3 threads{32U, 1U, 1U};
-  float elapsed_ms{0.0F};
+  BenchmarkResult result{};
   if (!measure(
           options, resources,
           [=, &resources, &tensor_maps](std::size_t launch_index) {
@@ -72,12 +72,12 @@ template <unsigned int Stages>
                 tensor_maps[workspace_index], tile_count, static_cast<unsigned int>(transfer_bytes));
             return SCINTHIL_CUDA_CHECK(cudaGetLastError());
           },
-          elapsed_ms)) {
+          0U, buffer_bytes, result)) {
     return false;
   }
 
   print_tma_bandwidth_benchmark_result("TMA tensor write-only", options, properties, resources.workspace_count, Stages,
-                                       elapsed_ms, 1.0);
+                                       result);
   return true;
 }
 
