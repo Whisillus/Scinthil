@@ -15,6 +15,7 @@ inline constexpr std::size_t L1CacheMinimumSizeKib{4U};
 inline constexpr std::size_t SharedMemorySizeGranularityKib{16U};
 inline constexpr std::size_t TmaMinimumTransferKib{1U};
 inline constexpr std::size_t TmaMaximumTransferKib{16U};
+inline constexpr unsigned int TmaMaximumBenchmarkStages{4U};
 inline constexpr unsigned int GlobalMemoryAccessesPerThreadIteration{4U};
 inline constexpr int SharedMemoryPassesPerLaunchGranularity{4};
 
@@ -30,6 +31,7 @@ struct RunMicrobenchmarkOptions {
   std::size_t l2_working_set_mib{0};
   std::size_t shared_kib_per_block{16};
   TmaKind tma_kind{TmaKind::None};
+  unsigned int tma_benchmark_stages{TmaMaximumBenchmarkStages};
   int passes_per_launch{4096};
   int warmup{5};
   int repeats{50};

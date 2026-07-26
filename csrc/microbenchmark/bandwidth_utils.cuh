@@ -169,18 +169,19 @@ template <typename Kernel>
 
 inline void print_tma_bandwidth_benchmark_result(const char* name, const RunMicrobenchmarkOptions& options,
                                                  const cudaDeviceProp& properties, std::size_t workspace_count,
-                                                 float elapsed_ms, double global_traffic_multiplier) {
+                                                 unsigned int stage_count, float elapsed_ms,
+                                                 double global_traffic_multiplier) {
   const double payload_bytes = static_cast<double>(options.global_mib_per_buffer * Byte2MByte) * options.repeats;
   const double seconds = static_cast<double>(elapsed_ms) / 1000.0;
   const double payload_gb_s = payload_bytes / seconds / 1.0e9;
   const double aggregate_global_gb_s = global_traffic_multiplier * payload_gb_s;
   std::printf(
-      "%s: device=%d (%s), buffer=%zu MiB, workspaces=%zu, transfer=%zu KiB, blocks=%u, "
+      "%s: device=%d (%s), buffer=%zu MiB, workspaces=%zu, transfer=%zu KiB, benchmark-stages=%u, blocks=%u, "
       "threads/block=%u, global-traffic=%.0fx, repeats=%d, average=%.3f ms, payload=%.2f GB/s, "
       "aggregate-global=%.2f GB/s\n",
       name, options.device, properties.name, options.global_mib_per_buffer, workspace_count,
-      options.shared_kib_per_block, properties.multiProcessorCount, 32U, global_traffic_multiplier, options.repeats,
-      elapsed_ms / options.repeats, payload_gb_s, aggregate_global_gb_s);
+      options.shared_kib_per_block, stage_count, properties.multiProcessorCount, 32U, global_traffic_multiplier,
+      options.repeats, elapsed_ms / options.repeats, payload_gb_s, aggregate_global_gb_s);
 }
 
 inline void print_shared_memory_bandwidth_benchmark_result(const char* name, const RunMicrobenchmarkOptions& options,

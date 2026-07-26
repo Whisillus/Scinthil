@@ -220,6 +220,13 @@ __device__ __forceinline__ void tma_store_commit() {
 #endif
 }
 
+template <unsigned int PendingGroups>
+__device__ __forceinline__ void tma_store_wait_read() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("cp.async.bulk.wait_group.read %0;" : : "n"(PendingGroups) : "memory");
+#endif
+}
+
 __device__ __forceinline__ void tma_store_wait() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   asm volatile("cp.async.bulk.wait_group 0;" : : : "memory");

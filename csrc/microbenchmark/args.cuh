@@ -48,7 +48,8 @@ inline void print_usage(const char* program) {
       "  %s <shared-memory-read|shared-memory-write|shared-memory-read-write> "
       "[--shared-kib-per-block N] [--passes-per-launch N] [--warmup N] [--repeats N] [--device N]\n"
       "  %s <tma-read|tma-write|tma-read-write> --tma-kind <bulk|tensor> "
-      "[--global-mib-per-buffer N] [--shared-kib-per-block N] [--warmup N] [--repeats N] [--device N]\n",
+      "[--global-mib-per-buffer N] [--shared-kib-per-block N] [--tma-benchmark-stages N] "
+      "[--warmup N] [--repeats N] [--device N]\n",
       program, program, program, program, program);
 }
 
@@ -209,6 +210,16 @@ inline void print_usage(const char* program) {
         return ParseResult::Error;
       }
       arguments.options.passes_per_launch = static_cast<int>(value);
+    } else if (std::strcmp(argv[index], "--tma-benchmark-stages") == 0) {
+      if (!is_tma_benchmark(arguments.benchmark)) {
+        std::fprintf(stderr, "--tma-benchmark-stages is not valid for this benchmark\n");
+        return ParseResult::Error;
+      }
+      if (!parse_number(argv[++index], 1, TmaMaximumBenchmarkStages, value)) {
+        std::fprintf(stderr, "invalid --tma-benchmark-stages value\n");
+        return ParseResult::Error;
+      }
+      arguments.options.tma_benchmark_stages = static_cast<unsigned int>(value);
     } else if (std::strcmp(argv[index], "--warmup") == 0) {
       if (!parse_number(argv[++index], 1, std::numeric_limits<int>::max(), value)) {
         std::fprintf(stderr, "invalid --warmup value\n");
